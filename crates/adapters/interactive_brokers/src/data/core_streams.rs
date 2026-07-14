@@ -8,11 +8,9 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
+    collections::{HashMap, VecDeque},
     fmt::Debug,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -77,103 +75,215 @@ impl IntoSubscriptionTick for SubscriptionItem<TickTypes> {
 }
 
 const SUBSCRIPTION_DISCONNECTED_CODE: i32 = 10182;
+const DATA_FARM_RECOVERY_HISTORY_LIMIT: usize = 1_024;
 const HISTORICAL_BAR_MIN_COUNT: i64 = 300;
 const HISTORICAL_BAR_RETRY_DELAY: Duration = Duration::from_secs(1);
 const IB_GENERIC_TICK_OPTION_OPEN_INTEREST: &str = "101";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DataFarmKind {
+    MarketData,
+    HistoricalData,
+    SecurityDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DataFarmIdentity {
+    kind: DataFarmKind,
+    name: Option<String>,
+}
+
+impl DataFarmIdentity {
+    fn from_notice(notice: &Notice) -> Option<Self> {
+        let kind = match notice.code {
+            2103 | 2104 => DataFarmKind::MarketData,
+            2105 | 2106 => DataFarmKind::HistoricalData,
+            2157 | 2158 => DataFarmKind::SecurityDefinition,
+            _ => return None,
+        };
+        let name = notice
+            .message
+            .rsplit_once(':')
+            .map(|(_, name)| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+
+        Some(Self { kind, name })
+    }
+
+    fn unnamed(kind: DataFarmKind) -> Self {
+        Self { kind, name: None }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DataFarmRecoveryState {
+    recoveries: VecDeque<(u64, UnixNanos)>,
+    recovery_generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct DataFarmState {
+    degraded_farms: HashMap<DataFarmIdentity, UnixNanos>,
+    market_data: DataFarmRecoveryState,
+    historical_data: DataFarmRecoveryState,
+    security_definition: DataFarmRecoveryState,
+}
+
+impl DataFarmState {
+    fn recovery(&self, kind: DataFarmKind) -> &DataFarmRecoveryState {
+        match kind {
+            DataFarmKind::MarketData => &self.market_data,
+            DataFarmKind::HistoricalData => &self.historical_data,
+            DataFarmKind::SecurityDefinition => &self.security_definition,
+        }
+    }
+
+    fn recovery_mut(&mut self, kind: DataFarmKind) -> &mut DataFarmRecoveryState {
+        match kind {
+            DataFarmKind::MarketData => &mut self.market_data,
+            DataFarmKind::HistoricalData => &mut self.historical_data,
+            DataFarmKind::SecurityDefinition => &mut self.security_definition,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct DataFarmConnectionState {
-    degraded_since_ns: Mutex<Option<UnixNanos>>,
-    last_recovery: Mutex<Option<(u64, UnixNanos)>>,
-    recovery_generation: AtomicU64,
+    state: Mutex<DataFarmState>,
     recovery_notify: tokio::sync::Notify,
 }
 
 impl DataFarmConnectionState {
     pub(super) fn handle_notice(&self, notice: &Notice, clock: &'static AtomicTime) {
-        if is_data_farm_broken_code(notice.code) {
-            self.mark_degraded(clock.get_time_ns());
-            tracing::debug!(
-                "IB data farm degraded by notice {} - {}; waiting for farm OK before resubscribe",
-                notice.code,
-                notice.message
-            );
-        } else if is_data_farm_ok_code(notice.code) && self.mark_ok() {
-            tracing::info!(
-                "IB data farm recovered by notice {} - {}; resubscribing data feeds",
-                notice.code,
-                notice.message
-            );
+        let Some(farm) = DataFarmIdentity::from_notice(notice) else {
+            return;
+        };
+
+        match notice.connectivity_status() {
+            Some(ConnectivityStatus::Broken) => {
+                self.mark_farm_degraded(farm, clock.get_time_ns());
+                tracing::debug!(
+                    "IB data farm degraded by notice {} - {}; waiting for farm OK before resubscribe",
+                    notice.code,
+                    notice.message
+                );
+            }
+            Some(ConnectivityStatus::Ok) if self.mark_ok(&farm) => {
+                tracing::info!(
+                    "IB data farm recovered by notice {} - {}; resubscribing data feeds",
+                    notice.code,
+                    notice.message
+                );
+            }
+            _ => {}
         }
     }
 
-    pub(super) fn mark_degraded(&self, degraded_since_ns: UnixNanos) {
-        let mut guard = self
-            .degraded_since_ns
-            .lock()
-            .expect("data farm state mutex poisoned");
-
-        if guard.is_none() {
-            *guard = Some(degraded_since_ns);
-        }
+    pub(super) fn mark_degraded(&self, generation: u64, degraded_since_ns: UnixNanos) {
+        self.mark_degraded_for(DataFarmKind::MarketData, generation, degraded_since_ns);
     }
 
-    fn mark_ok(&self) -> bool {
-        let Some(degraded_since_ns) = self
-            .degraded_since_ns
-            .lock()
-            .expect("data farm state mutex poisoned")
-            .take()
+    fn mark_degraded_for(&self, kind: DataFarmKind, generation: u64, degraded_since_ns: UnixNanos) {
+        let mut state = self.state.lock().expect("data farm state mutex poisoned");
+
+        if state.recovery(kind).recovery_generation != generation {
+            return;
+        }
+
+        state
+            .degraded_farms
+            .entry(DataFarmIdentity::unnamed(kind))
+            .and_modify(|current| *current = (*current).min(degraded_since_ns))
+            .or_insert(degraded_since_ns);
+    }
+
+    fn mark_farm_degraded(&self, farm: DataFarmIdentity, degraded_since_ns: UnixNanos) {
+        let mut state = self.state.lock().expect("data farm state mutex poisoned");
+
+        state
+            .degraded_farms
+            .entry(farm)
+            .and_modify(|current| *current = (*current).min(degraded_since_ns))
+            .or_insert(degraded_since_ns);
+    }
+
+    fn mark_ok(&self, farm: &DataFarmIdentity) -> bool {
+        let mut state = self.state.lock().expect("data farm state mutex poisoned");
+
+        let degraded_since_ns = state.degraded_farms.remove(farm);
+        let generic_degraded_since_ns = state
+            .degraded_farms
+            .remove(&DataFarmIdentity::unnamed(farm.kind));
+        let Some(degraded_since_ns) =
+            earliest_data_loss_ns(degraded_since_ns, generic_degraded_since_ns)
         else {
             return false;
         };
 
-        let generation = self.recovery_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        *self
-            .last_recovery
-            .lock()
-            .expect("data farm recovery mutex poisoned") = Some((generation, degraded_since_ns));
+        let recovery = state.recovery_mut(farm.kind);
+        recovery.recovery_generation = recovery.recovery_generation.wrapping_add(1);
+        let recovery_generation = recovery.recovery_generation;
+        recovery
+            .recoveries
+            .push_back((recovery_generation, degraded_since_ns));
+
+        if recovery.recoveries.len() > DATA_FARM_RECOVERY_HISTORY_LIMIT {
+            let (_, pruned_since_ns) = recovery.recoveries.pop_front().unwrap();
+            if let Some((_, retained_since_ns)) = recovery.recoveries.front_mut() {
+                // Preserve the earliest replay boundary for streams lagging behind the history
+                *retained_since_ns = (*retained_since_ns).min(pruned_since_ns);
+            }
+        }
+        drop(state);
         self.recovery_notify.notify_waiters();
         true
     }
 
     fn recovery_generation(&self) -> u64 {
-        self.recovery_generation.load(Ordering::Relaxed)
+        self.recovery_generation_for(DataFarmKind::MarketData)
     }
 
-    fn last_recovery_since_ns(&self, generation: u64) -> Option<UnixNanos> {
-        self.last_recovery
+    fn recovery_generation_for(&self, kind: DataFarmKind) -> u64 {
+        self.state
             .lock()
-            .expect("data farm recovery mutex poisoned")
-            .and_then(|(recovery_generation, degraded_since_ns)| {
-                (recovery_generation == generation).then_some(degraded_since_ns)
+            .expect("data farm state mutex poisoned")
+            .recovery(kind)
+            .recovery_generation
+    }
+
+    fn recovery_since_ns_after_for(
+        &self,
+        kind: DataFarmKind,
+        generation: u64,
+    ) -> Option<UnixNanos> {
+        self.state
+            .lock()
+            .expect("data farm state mutex poisoned")
+            .recovery(kind)
+            .recoveries
+            .iter()
+            .filter_map(|(recovery_generation, degraded_since_ns)| {
+                (*recovery_generation > generation).then_some(*degraded_since_ns)
             })
+            .min()
     }
 
     async fn wait_for_recovery_after(&self, generation: u64) {
+        self.wait_for_recovery_after_for(DataFarmKind::MarketData, generation)
+            .await;
+    }
+
+    async fn wait_for_recovery_after_for(&self, kind: DataFarmKind, generation: u64) {
         loop {
             let notified = self.recovery_notify.notified();
 
-            if self.recovery_generation() != generation {
+            if self.recovery_generation_for(kind) != generation {
                 return;
             }
             notified.await;
         }
     }
-}
-
-fn is_data_farm_broken_code(code: i32) -> bool {
-    matches!(
-        ConnectivityStatus::from_code(code),
-        Some(ConnectivityStatus::Broken)
-    )
-}
-
-fn is_data_farm_ok_code(code: i32) -> bool {
-    matches!(
-        ConnectivityStatus::from_code(code),
-        Some(ConnectivityStatus::Ok)
-    )
 }
 
 fn is_subscription_disconnected_error(error: &Error) -> bool {
@@ -194,8 +304,23 @@ async fn wait_for_data_farm_recovery_or_cancel(
     generation: u64,
     cancellation_token: &CancellationToken,
 ) -> bool {
+    wait_for_data_farm_recovery_or_cancel_for(
+        data_farm_state,
+        DataFarmKind::MarketData,
+        generation,
+        cancellation_token,
+    )
+    .await
+}
+
+async fn wait_for_data_farm_recovery_or_cancel_for(
+    data_farm_state: &DataFarmConnectionState,
+    kind: DataFarmKind,
+    generation: u64,
+    cancellation_token: &CancellationToken,
+) -> bool {
     tokio::select! {
-        () = data_farm_state.wait_for_recovery_after(generation) => true,
+        () = data_farm_state.wait_for_recovery_after_for(kind, generation) => true,
         () = cancellation_token.cancelled() => false,
     }
 }
@@ -288,7 +413,7 @@ pub(super) async fn handle_historical_bars_subscription(
 
     let first_start_ns = resolve_historical_bar_start_ns(start_ns, clock.get_time_ns());
     let mut last_disconnection_ns = None;
-    let mut farm_generation = data_farm_state.recovery_generation();
+    let mut farm_generation = data_farm_state.recovery_generation_for(DataFarmKind::HistoricalData);
     // Only stamp last_disconnection_ns after receiving real data, mirroring the Python
     // adapter's _had_ib_connection guard. historical_data_streaming() returns Ok after
     // sending the request; server-side errors arrive later via subscription.next(). A
@@ -404,15 +529,20 @@ pub(super) async fn handle_historical_bars_subscription(
                         }
                         Some(Err(e)) => {
                             if is_subscription_disconnected_error(&e) {
-                                data_farm_state.mark_degraded(clock.get_time_ns());
+                                data_farm_state.mark_degraded_for(
+                                    DataFarmKind::HistoricalData,
+                                    farm_generation,
+                                    clock.get_time_ns(),
+                                );
                                 tracing::warn!(
                                     "Historical bars subscription disconnected for {}; waiting for data farm recovery: {:?}",
                                     bar_type,
                                     e
                                 );
 
-                                if !wait_for_data_farm_recovery_or_cancel(
+                                if !wait_for_data_farm_recovery_or_cancel_for(
                                     &data_farm_state,
+                                    DataFarmKind::HistoricalData,
                                     farm_generation,
                                     &cancellation_token,
                                 )
@@ -421,10 +551,14 @@ pub(super) async fn handle_historical_bars_subscription(
                                     subscription.cancel().await;
                                     return Ok(());
                                 }
-                                let recovered_generation = data_farm_state.recovery_generation();
+                                let recovered_generation = data_farm_state
+                                    .recovery_generation_for(DataFarmKind::HistoricalData);
                                 last_disconnection_ns = earliest_data_loss_ns(
                                     last_disconnection_ns,
-                                    data_farm_state.last_recovery_since_ns(recovered_generation),
+                                    data_farm_state.recovery_since_ns_after_for(
+                                        DataFarmKind::HistoricalData,
+                                        farm_generation,
+                                    ),
                                 );
                                 farm_generation = recovered_generation;
                                 break;
@@ -460,11 +594,18 @@ pub(super) async fn handle_historical_bars_subscription(
                         }
                     }
                 }
-                () = data_farm_state.wait_for_recovery_after(farm_generation) => {
-                    let recovered_generation = data_farm_state.recovery_generation();
+                () = data_farm_state.wait_for_recovery_after_for(
+                    DataFarmKind::HistoricalData,
+                    farm_generation,
+                ) => {
+                    let recovered_generation = data_farm_state
+                        .recovery_generation_for(DataFarmKind::HistoricalData);
                     last_disconnection_ns = earliest_data_loss_ns(
                         last_disconnection_ns,
-                        data_farm_state.last_recovery_since_ns(recovered_generation),
+                        data_farm_state.recovery_since_ns_after_for(
+                            DataFarmKind::HistoricalData,
+                            farm_generation,
+                        ),
                     );
                     farm_generation = recovered_generation;
                     subscription.cancel().await;
@@ -535,7 +676,7 @@ pub(super) async fn handle_quote_subscription(
                     if let Err(e) = &tick_result
                         && is_subscription_disconnected_error(e)
                     {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Quote subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             instrument_id,
@@ -638,7 +779,7 @@ pub(super) async fn handle_option_greeks_subscription(
                     if let Err(e) = &tick_result
                         && is_subscription_disconnected_error(e)
                     {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Option greeks subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             instrument_id,
@@ -739,7 +880,7 @@ pub(super) async fn handle_index_price_subscription(
                     if let Err(e) = &tick_result
                         && is_subscription_disconnected_error(e)
                     {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Index price subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             instrument_id,
@@ -875,7 +1016,7 @@ pub(super) async fn handle_tick_by_tick_quote_subscription(
                             );
                         }
                         Some(Err(e)) if is_subscription_disconnected_error(&e) => {
-                            data_farm_state.mark_degraded(clock.get_time_ns());
+                            data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                             tracing::warn!(
                                 "Tick-by-tick quote subscription disconnected for {}; waiting for data farm recovery: {:?}",
                                 instrument_id,
@@ -1095,7 +1236,7 @@ async fn process_trade_stream(
                         );
                     }
                     Some(Err(e)) if is_subscription_disconnected_error(&e) => {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Trade subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             instrument_id,
@@ -1195,7 +1336,7 @@ async fn process_realtime_bar_stream(
                         );
                     }
                     Some(Err(e)) if is_subscription_disconnected_error(&e) => {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Realtime bar subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             bar_type,
@@ -1317,7 +1458,7 @@ async fn process_market_depth_stream(
                         );
                     }
                     Some(Err(e)) if is_subscription_disconnected_error(&e) => {
-                        data_farm_state.mark_degraded(clock.get_time_ns());
+                        data_farm_state.mark_degraded(farm_generation, clock.get_time_ns());
                         tracing::warn!(
                             "Market depth subscription disconnected for {}; waiting for data farm recovery: {:?}",
                             instrument_id,
@@ -1851,8 +1992,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        DataFarmConnectionState, OptionGreeksCache, QuoteCache, StreamAction,
-        process_index_price_tick_result, process_market_depth_stream,
+        DataFarmConnectionState, DataFarmIdentity, DataFarmKind, OptionGreeksCache, QuoteCache,
+        StreamAction, process_index_price_tick_result, process_market_depth_stream,
         process_option_greeks_tick_result, process_quote_tick_result, process_realtime_bar_stream,
         process_trade_stream, send_quote_tick, update_quote_from_price_tick,
         update_revised_bar_tracking,
@@ -1950,9 +2091,162 @@ mod tests {
         assert_eq!(data_farm_state.recovery_generation(), 1);
         assert!(
             data_farm_state
-                .last_recovery_since_ns(data_farm_state.recovery_generation())
+                .recovery_since_ns_after_for(DataFarmKind::MarketData, 0)
                 .is_some()
         );
+    }
+
+    #[rstest]
+    fn test_data_farm_state_recovers_each_reported_farm_independently() {
+        let clock = get_atomic_clock_realtime();
+        let data_farm_state = DataFarmConnectionState::default();
+
+        data_farm_state.handle_notice(
+            &notice(2103, "Market data farm connection is broken:usfarm.nj"),
+            clock,
+        );
+        data_farm_state.handle_notice(
+            &notice(2103, "Market data farm connection is broken:cashfarm"),
+            clock,
+        );
+        data_farm_state.handle_notice(
+            &notice(2105, "HMDS data farm connection is broken:ushmds"),
+            clock,
+        );
+
+        data_farm_state.handle_notice(&notice(2104, "Market data farm connection is OK"), clock);
+        assert_eq!(data_farm_state.recovery_generation(), 0);
+
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:usfarm.nj"),
+            clock,
+        );
+        assert_eq!(data_farm_state.recovery_generation(), 1);
+        assert_eq!(
+            data_farm_state.recovery_generation_for(DataFarmKind::HistoricalData),
+            0
+        );
+
+        data_farm_state.handle_notice(
+            &notice(2106, "HMDS data farm connection is OK:ushmds"),
+            clock,
+        );
+        assert_eq!(data_farm_state.recovery_generation(), 1);
+        assert_eq!(
+            data_farm_state.recovery_generation_for(DataFarmKind::HistoricalData),
+            1
+        );
+
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:cashfarm"),
+            clock,
+        );
+        assert_eq!(data_farm_state.recovery_generation(), 2);
+    }
+
+    #[rstest]
+    fn test_data_farm_state_preserves_each_farm_degradation_time() {
+        let clock = get_atomic_clock_realtime();
+        let data_farm_state = DataFarmConnectionState::default();
+
+        data_farm_state.mark_farm_degraded(
+            DataFarmIdentity {
+                kind: DataFarmKind::MarketData,
+                name: Some(String::from("usfarm.nj")),
+            },
+            UnixNanos::from(20),
+        );
+        data_farm_state.mark_farm_degraded(
+            DataFarmIdentity {
+                kind: DataFarmKind::MarketData,
+                name: Some(String::from("cashfarm")),
+            },
+            UnixNanos::from(10),
+        );
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:usfarm.nj"),
+            clock,
+        );
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:cashfarm"),
+            clock,
+        );
+        let latest_generation = data_farm_state.recovery_generation();
+
+        assert_eq!(latest_generation, 2);
+        assert_eq!(
+            data_farm_state.recovery_since_ns_after_for(DataFarmKind::MarketData, 0),
+            Some(UnixNanos::from(10))
+        );
+        assert_eq!(
+            data_farm_state.recovery_since_ns_after_for(DataFarmKind::MarketData, 1),
+            Some(UnixNanos::from(10))
+        );
+    }
+
+    #[rstest]
+    fn test_data_farm_state_ignores_stale_subscription_degradation() {
+        let clock = get_atomic_clock_realtime();
+        let data_farm_state = DataFarmConnectionState::default();
+        let initial_generation = data_farm_state.recovery_generation();
+
+        data_farm_state.mark_degraded(initial_generation, UnixNanos::from(10));
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:usfarm.nj"),
+            clock,
+        );
+        data_farm_state.mark_degraded(initial_generation, UnixNanos::from(20));
+
+        let state = data_farm_state
+            .state
+            .lock()
+            .expect("data farm state mutex poisoned");
+        assert_eq!(state.market_data.recovery_generation, 1);
+        assert!(state.degraded_farms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_data_farm_state_preserves_recovery_during_resubscription() {
+        let clock = get_atomic_clock_realtime();
+        let data_farm_state = Arc::new(DataFarmConnectionState::default());
+        let initial_generation = data_farm_state.recovery_generation();
+
+        data_farm_state.handle_notice(
+            &notice(2103, "Market data farm connection is broken:usfarm.nj"),
+            clock,
+        );
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:usfarm.nj"),
+            clock,
+        );
+        data_farm_state
+            .wait_for_recovery_after(initial_generation)
+            .await;
+        let resubscription_generation = data_farm_state.recovery_generation();
+
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let state_for_resubscription = Arc::clone(&data_farm_state);
+
+        let resubscription_task = tokio::spawn(async move {
+            release_receiver.await.unwrap();
+            state_for_resubscription
+                .wait_for_recovery_after(resubscription_generation)
+                .await;
+            state_for_resubscription.recovery_generation()
+        });
+
+        data_farm_state.handle_notice(
+            &notice(2103, "Market data farm connection is broken:cashfarm"),
+            clock,
+        );
+        data_farm_state.handle_notice(
+            &notice(2104, "Market data farm connection is OK:cashfarm"),
+            clock,
+        );
+        release_sender.send(()).unwrap();
+        let observed_generation = resubscription_task.await.unwrap();
+
+        assert_eq!(observed_generation, 2);
     }
 
     #[tokio::test]
@@ -2464,10 +2758,11 @@ mod tests {
         let recovery_task = tokio::spawn(async move {
             loop {
                 if state_for_recovery
-                    .degraded_since_ns
+                    .state
                     .lock()
                     .expect("data farm state mutex poisoned")
-                    .is_some()
+                    .degraded_farms
+                    .contains_key(&DataFarmIdentity::unnamed(DataFarmKind::MarketData))
                 {
                     state_for_recovery.handle_notice(
                         &notice(2104, "Market data farm connection is OK:usfarm"),
