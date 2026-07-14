@@ -147,6 +147,12 @@ pub struct BinanceExecClientConfig {
     /// Whether to use the WebSocket trading API for order operations (Spot and USD-M Futures).
     #[builder(default = true)]
     pub use_ws_trading: bool,
+    /// Whether Spot connection readiness requires authenticated WS user data.
+    ///
+    /// When enabled, authentication, subscription, or dispatch setup failure fails connect
+    /// instead of permitting the legacy HTTP-only execution fallback.
+    #[builder(default = false)]
+    pub require_ws_trading: bool,
     /// Whether to use Binance Futures hedging position IDs.
     ///
     /// When true, fill reports include a `venue_position_id` derived from

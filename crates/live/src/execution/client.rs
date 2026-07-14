@@ -22,15 +22,16 @@
 //! second adapter client instance. Instrument updates are deferred while a client request is in
 //! progress and flushed when the request completes.
 
-use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc, sync::Arc};
 
 use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+        CorrelatedTruthReporter, GenerateFillReports, GenerateOrderStatusReport,
+        GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+        QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::UnixNanos;
@@ -41,7 +42,10 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny},
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport,
+        PrivateStreamHealth,
+    },
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 
@@ -166,6 +170,20 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.client.borrow().get_account()
+    }
+
+    fn correlated_truth_reporter(&self) -> Option<Arc<dyn CorrelatedTruthReporter>> {
+        self.client.borrow().correlated_truth_reporter()
+    }
+
+    fn private_stream_health(&self) -> Option<PrivateStreamHealth> {
+        self.client.borrow().private_stream_health()
+    }
+
+    fn mark_private_stream_reconciled(&self, generation: u64, ts_now: UnixNanos) -> bool {
+        self.client
+            .borrow()
+            .mark_private_stream_reconciled(generation, ts_now)
     }
 
     fn handles_order_venue(&self, venue: Venue) -> bool {

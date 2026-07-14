@@ -28,6 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     rc::Rc,
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -86,11 +87,12 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 
 use crate::{
+    anomaly::{ExecutionAnomalySink, FillValidationErrorV1, RejectedOverfillV1},
     client::ExecutionClientAdapter,
     reconciliation::{
         check_position_reconciliation, create_incremental_inferred_fill,
         generate_external_order_status_events, generate_reconciliation_order_events,
-        reconcile_fill_report as reconcile_fill,
+        reconcile_fill_report_strict as reconcile_fill,
     },
 };
 
@@ -137,6 +139,7 @@ pub struct ExecutionEngine {
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
+    execution_anomaly_sink: Option<Arc<dyn ExecutionAnomalySink>>,
 }
 
 impl Debug for ExecutionEngine {
@@ -178,6 +181,7 @@ impl ExecutionEngine {
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
+            execution_anomaly_sink: None,
         }
     }
 
@@ -333,6 +337,11 @@ impl ExecutionEngine {
     /// `None` disables anchor recording for later cache snapshots.
     pub fn set_snapshot_anchorer(&mut self, anchorer: Option<SnapshotAnchorer>) {
         self.snapshot_anchorer = anchorer;
+    }
+
+    /// Installs the synchronous sink for rejected venue-exposure anomalies.
+    pub fn set_execution_anomaly_sink(&mut self, sink: Option<Arc<dyn ExecutionAnomalySink>>) {
+        self.execution_anomaly_sink = sink;
     }
 
     #[must_use]
@@ -1615,15 +1624,25 @@ impl ExecutionEngine {
         };
 
         let ts_now = self.clock.borrow().timestamp_ns();
+        let client_order_id = order.client_order_id();
+        let Some(client_id) = self.cache.borrow().client_id(&client_order_id).copied() else {
+            self.handle_fill_validation_error(FillValidationErrorV1::MissingCachedOrigin(
+                client_order_id,
+            ));
+            return;
+        };
 
-        if let Some(event) = reconcile_fill(
+        match reconcile_fill(
             &order,
             report,
             &instrument,
             ts_now,
             self.config.allow_overfills,
+            client_id,
         ) {
-            self.handle_event(&event);
+            Ok(Some(event)) => self.handle_event(&event),
+            Ok(None) => {}
+            Err(error) => self.handle_fill_validation_error(error),
         }
     }
 
@@ -1697,15 +1716,31 @@ impl ExecutionEngine {
 
         for fill in fills {
             let ts_now = self.clock.borrow().timestamp_ns();
+            let Some(client_id) = self.cache.borrow().client_id(&client_order_id).copied() else {
+                self.handle_fill_validation_error(FillValidationErrorV1::MissingCachedOrigin(
+                    client_order_id,
+                ));
+                return;
+            };
 
-            if let Some(event) = reconcile_fill(
+            match reconcile_fill(
                 &order,
                 fill,
                 &instrument,
                 ts_now,
                 self.config.allow_overfills,
+                client_id,
             ) {
-                self.handle_event(&event);
+                Ok(Some(event)) => self.handle_event(&event),
+                Ok(None) => {}
+                Err(
+                    FillValidationErrorV1::DuplicateFill
+                    | FillValidationErrorV1::DuplicatePositionFill,
+                ) => {}
+                Err(error) => {
+                    self.handle_fill_validation_error(error);
+                    return;
+                }
             }
 
             // Refresh order after fill to keep filled_qty accurate for the next iteration.
@@ -2874,19 +2909,19 @@ impl ExecutionEngine {
                 let mut fill = *fill;
                 fill.position_id = Some(position_id);
 
-                if self
-                    .validate_fill_for_order(&order_before_fill, &fill)
-                    .is_ok()
-                {
-                    let event = OrderEventAny::Filled(fill);
-                    let Some(order) = self.update_cached_order(client_order_id, &event) else {
-                        return;
-                    };
-
-                    let position_events = self.handle_order_fill(&order, fill, oms_type);
-                    self.publish_order_event(&event);
-                    self.publish_position_events(position_events);
+                if let Err(error) = self.validate_fill_for_order(&order_before_fill, &fill) {
+                    self.handle_fill_validation_error(error);
+                    return;
                 }
+
+                let event = OrderEventAny::Filled(fill);
+                let Some(order) = self.update_cached_order(client_order_id, &event) else {
+                    return;
+                };
+
+                let position_events = self.handle_order_fill(&order, fill, oms_type);
+                self.publish_order_event(&event);
+                self.publish_position_events(position_events);
             }
             _ => {
                 if self.update_cached_order(client_order_id, &event).is_some() {
@@ -3187,14 +3222,18 @@ impl ExecutionEngine {
         PositionId::new(format!("{}-{}", fill.instrument_id, fill.strategy_id))
     }
 
-    fn validate_fill_for_order(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
+    fn validate_fill_for_order(
+        &self,
+        order: &OrderAny,
+        fill: &OrderFilled,
+    ) -> Result<(), FillValidationErrorV1> {
         if order.is_duplicate_fill(fill) {
             log::warn!(
                 "Duplicate fill: {} trade_id={} already applied, skipping",
                 order.client_order_id(),
                 fill.trade_id
             );
-            anyhow::bail!("Duplicate fill");
+            return Err(FillValidationErrorV1::DuplicateFill);
         }
 
         if let Some(position_id) = fill.position_id
@@ -3206,10 +3245,31 @@ impl ExecutionEngine {
                 fill.trade_id,
                 position_id
             );
-            anyhow::bail!("Duplicate position fill");
+            return Err(FillValidationErrorV1::DuplicatePositionFill);
         }
 
         self.check_overfill(order, fill)
+    }
+
+    fn handle_fill_validation_error(&self, error: FillValidationErrorV1) {
+        match error {
+            FillValidationErrorV1::DuplicateFill | FillValidationErrorV1::DuplicatePositionFill => {
+            }
+            FillValidationErrorV1::MissingCachedOrigin(client_order_id) => {
+                log::error!(
+                    "Cannot surface rejected fill for {client_order_id}: cached client origin missing"
+                );
+            }
+            FillValidationErrorV1::RejectedOverfill(event) => {
+                if let Some(sink) = &self.execution_anomaly_sink {
+                    sink.record_rejected_overfill(*event);
+                } else {
+                    log::error!(
+                        "Rejected overfill could not cross the execution boundary: anomaly sink missing"
+                    );
+                }
+            }
+        }
     }
 
     fn position_contains_trade_id(&self, position_id: PositionId, trade_id: TradeId) -> bool {
@@ -3389,7 +3449,11 @@ impl ExecutionEngine {
         }
     }
 
-    fn check_overfill(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
+    fn check_overfill(
+        &self,
+        order: &OrderAny,
+        fill: &OrderFilled,
+    ) -> Result<(), FillValidationErrorV1> {
         let potential_overfill = order.calculate_overfill(fill.last_qty);
 
         if potential_overfill.is_positive() {
@@ -3403,16 +3467,26 @@ impl ExecutionEngine {
                     order.quantity()
                 );
             } else {
-                let msg = format!(
-                    "Order overfill rejected: {} potential_overfill={}, current_filled={}, last_qty={}, quantity={}. \
-                Set `allow_overfills=true` in ExecutionEngineConfig to allow overfills.",
-                    order.client_order_id(),
-                    potential_overfill,
-                    order.filled_qty(),
-                    fill.last_qty,
-                    order.quantity()
-                );
-                anyhow::bail!("{msg}");
+                let client_order_id = order.client_order_id();
+                let client_id = self
+                    .cache
+                    .borrow()
+                    .client_id(&client_order_id)
+                    .copied()
+                    .ok_or(FillValidationErrorV1::MissingCachedOrigin(client_order_id))?;
+                return Err(FillValidationErrorV1::RejectedOverfill(Box::new(
+                    RejectedOverfillV1 {
+                        client_id,
+                        account_id: fill.account_id,
+                        instrument_id: fill.instrument_id,
+                        client_order_id,
+                        trade_id: fill.trade_id,
+                        order_quantity_raw: order.quantity().raw,
+                        prior_filled_raw: order.filled_qty().raw,
+                        rejected_last_quantity_raw: fill.last_qty.raw,
+                        observed_at: self.clock.borrow().timestamp_ns(),
+                    },
+                )));
             }
         }
 

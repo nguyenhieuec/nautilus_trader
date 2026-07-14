@@ -25,6 +25,7 @@ pub mod error;
 pub mod execution;
 pub mod models;
 pub mod parse;
+pub(crate) mod private_stream;
 pub mod status;
 pub mod symbol;
 pub mod urls;

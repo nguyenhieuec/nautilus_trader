@@ -15,6 +15,8 @@
 
 //! Execution client trait definition.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -24,15 +26,19 @@ use nautilus_model::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
     instruments::InstrumentAny,
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport,
+        PrivateStreamHealth,
+    },
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 
 use super::log_not_implemented;
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-    ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, CorrelatedTruthReporter,
+    GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+    GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+    SubmitOrderList,
 };
 
 /// Defines the interface for an execution client managing order operations.
@@ -49,6 +55,21 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Returns a read-only, identity-correlated truth reporter when supported.
+    fn correlated_truth_reporter(&self) -> Option<Arc<dyn CorrelatedTruthReporter>> {
+        None
+    }
+
+    /// Returns authenticated private-stream health when supported.
+    fn private_stream_health(&self) -> Option<PrivateStreamHealth> {
+        None
+    }
+
+    /// Promotes the current authenticated stream generation after strict reconciliation.
+    fn mark_private_stream_reconciled(&self, _generation: u64, _ts_now: UnixNanos) -> bool {
+        false
+    }
 
     /// Returns whether this client can execute orders for the given instrument venue.
     ///

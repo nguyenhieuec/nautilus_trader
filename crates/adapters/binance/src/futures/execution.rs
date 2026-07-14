@@ -16,6 +16,7 @@
 //! Live execution client implementation for the Binance Futures adapter.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{
         Arc, Mutex, RwLock,
@@ -32,10 +33,11 @@ use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
+        BatchCancelOrders, CancelAllOrders, CancelOrder, CorrelatedTruthReporter,
+        GenerateBinanceTruthReport, GenerateFillReports, GenerateOrderStatusReport,
+        GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TruthReportError,
     },
 };
 use nautilus_core::{
@@ -57,7 +59,10 @@ use nautilus_model::{
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, Venue, VenueOrderId},
     instruments::Instrument,
     orders::{Order, OrderAny},
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        BinanceModeProof, BinanceTruthReport, ExactOrderQueryResult, ExecutionMassStatus,
+        FillReport, OrderStatusReport, PositionStatusReport, PrivateStreamHealth,
+    },
     types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
 use rust_decimal::Decimal;
@@ -91,8 +96,8 @@ use crate::{
         consts::{
             BINANCE_FUTURES_DUAL_SIDE_SYNC_REJECT_CODE, BINANCE_FUTURES_USD_WS_API_TESTNET_URL,
             BINANCE_FUTURES_USD_WS_API_URL, BINANCE_GTX_ORDER_REJECT_CODE,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_STATUS_UNKNOWN_CODE,
-            BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
+            BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_NO_SUCH_ORDER_CODE,
+            BINANCE_STATUS_UNKNOWN_CODE, BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
         },
         credential::resolve_credentials,
         dispatch::{OrderIdentity, PendingOperation, PendingRequest, WsDispatchState},
@@ -101,6 +106,7 @@ use crate::{
             BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide, BinancePriceMatch,
             BinanceProductType, BinanceSide, BinanceTimeInForce, BinanceWorkingType,
         },
+        private_stream::PrivateStreamHealthHandle,
         symbol::format_binance_symbol,
         urls::{get_usdm_ws_route_base_url, get_ws_private_base_url},
     },
@@ -120,6 +126,175 @@ use crate::{
         },
     },
 };
+
+#[derive(Clone, Debug)]
+struct BinanceFuturesTruthReporter {
+    client_id: ClientId,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    http_client: BinanceFuturesHttpClient,
+    dispatch_state: Arc<WsDispatchState>,
+    instruments: Arc<DashMap<ustr::Ustr, BinanceFuturesInstrument>>,
+}
+
+impl BinanceFuturesTruthReporter {
+    fn position_report(
+        &self,
+        position: &BinancePositionRisk,
+        instrument: &BinanceFuturesInstrument,
+    ) -> Result<Option<PositionStatusReport>, TruthReportError> {
+        let amount = position.position_amt.parse::<Decimal>().map_err(|error| {
+            TruthReportError::Positions(format!("invalid {} amount: {error}", position.symbol))
+        })?;
+        if amount.is_zero() {
+            return Ok(None);
+        }
+        let entry_price = position.entry_price.parse::<Decimal>().map_err(|error| {
+            TruthReportError::Positions(format!("invalid {} entry price: {error}", position.symbol))
+        })?;
+        let side = if amount.is_sign_positive() {
+            PositionSideSpecified::Long
+        } else {
+            PositionSideSpecified::Short
+        };
+        let size_precision = u8::try_from(instrument.quantity_precision()).map_err(|error| {
+            TruthReportError::Positions(format!("invalid {} precision: {error}", position.symbol))
+        })?;
+        let ts_now = self.clock.get_time_ns();
+        let quantity = Quantity::from_decimal_dp(amount.abs(), size_precision)
+            .map_err(|error| TruthReportError::Positions(error.to_string()))?;
+        Ok(Some(PositionStatusReport::new(
+            self.account_id,
+            instrument.id(),
+            side,
+            quantity,
+            ts_now,
+            ts_now,
+            Some(UUID4::new()),
+            None,
+            Some(entry_price),
+        )))
+    }
+}
+
+#[async_trait]
+impl CorrelatedTruthReporter for BinanceFuturesTruthReporter {
+    async fn generate_truth_report(
+        &self,
+        request: GenerateBinanceTruthReport,
+    ) -> Result<BinanceTruthReport, TruthReportError> {
+        if request.client_id != self.client_id {
+            return Err(TruthReportError::ClientIdMismatch {
+                expected: self.client_id,
+                actual: request.client_id,
+            });
+        }
+        if request.account_id != self.account_id {
+            return Err(TruthReportError::AccountIdMismatch {
+                expected: self.account_id,
+                actual: request.account_id,
+            });
+        }
+
+        let position_params = BinancePositionRiskParamsBuilder::default()
+            .build()
+            .map_err(|error| TruthReportError::Positions(error.to_string()))?;
+        let account_future = self.http_client.request_account_info();
+        let mode_future = self.http_client.query_hedge_mode();
+        let open_orders_future =
+            self.http_client
+                .request_order_status_reports(self.account_id, None, true);
+        let positions_future = self.http_client.query_positions(&position_params);
+        let (account_result, mode_result, open_orders_result, positions_result) = tokio::join!(
+            account_future,
+            mode_future,
+            open_orders_future,
+            positions_future
+        );
+        let account_info =
+            account_result.map_err(|error| TruthReportError::Account(error.to_string()))?;
+        let mode = mode_result.map_err(|error| TruthReportError::Mode(error.to_string()))?;
+        let open_orders =
+            open_orders_result.map_err(|error| TruthReportError::OpenOrders(error.to_string()))?;
+        let raw_positions =
+            positions_result.map_err(|error| TruthReportError::Positions(error.to_string()))?;
+
+        let balances = account_info
+            .to_account_state(self.account_id, request.ts_init)
+            .map_err(|error| TruthReportError::Account(error.to_string()))?
+            .balances;
+        let mut positions = Vec::new();
+        for position in &raw_positions {
+            let instrument = self
+                .instruments
+                .get(&ustr::Ustr::from(&position.symbol))
+                .ok_or_else(|| {
+                    TruthReportError::Positions(format!("missing instrument {}", position.symbol))
+                })?;
+            if let Some(report) = self.position_report(position, instrument.value())? {
+                positions.push(report);
+            }
+        }
+
+        let mut exact_orders = BTreeMap::new();
+        for client_order_id in request.exact_order_ids {
+            let instrument_id = self
+                .dispatch_state
+                .order_identities
+                .get(&client_order_id)
+                .map(|identity| identity.instrument_id)
+                .ok_or(TruthReportError::MissingOrderOrigin(client_order_id))?;
+            let exact = match self
+                .http_client
+                .request_order_status_report(
+                    self.account_id,
+                    instrument_id,
+                    None,
+                    Some(client_order_id),
+                )
+                .await
+            {
+                Ok(report) => ExactOrderQueryResult::Found(Box::new(report)),
+                Err(error)
+                    if error.downcast_ref::<BinanceFuturesHttpError>().is_some_and(|error| {
+                        matches!(error, BinanceFuturesHttpError::BinanceError { code, .. } if *code == BINANCE_NO_SUCH_ORDER_CODE)
+                    }) =>
+                {
+                    ExactOrderQueryResult::NotFound
+                }
+                Err(error) => {
+                    return Err(TruthReportError::ExactOrder {
+                        client_order_id,
+                        detail: error.to_string(),
+                    });
+                }
+            };
+            exact_orders.insert(client_order_id, exact);
+        }
+
+        Ok(BinanceTruthReport {
+            request_id: request.request_id,
+            client_id: self.client_id,
+            account_id: self.account_id,
+            mode: BinanceModeProof::UsdM {
+                can_trade: account_info.can_trade.ok_or_else(|| {
+                    TruthReportError::Mode("Futures account omitted can_trade".to_string())
+                })?,
+                dual_side_position: mode.dual_side_position,
+                multi_assets_margin: account_info.multi_assets_margin.ok_or_else(|| {
+                    TruthReportError::Mode(
+                        "Futures account omitted multi_assets_margin".to_string(),
+                    )
+                })?,
+            },
+            balances,
+            positions,
+            open_orders,
+            exact_orders,
+            ts_received: self.clock.get_time_ns(),
+        })
+    }
+}
 
 /// Listen key keepalive interval (30 minutes).
 const LISTEN_KEY_KEEPALIVE_SECS: u64 = 30 * 60;
@@ -156,6 +331,8 @@ pub struct BinanceFuturesExecutionClient {
     recovery_task: Mutex<Option<JoinHandle<()>>>,
     recovery_lock: Arc<TokioMutex<()>>,
     recovery_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
+    private_stream_health: PrivateStreamHealthHandle,
+    truth_reporter: Arc<BinanceFuturesTruthReporter>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     is_hedge_mode: AtomicBool,
 }
@@ -233,12 +410,24 @@ impl BinanceFuturesExecutionClient {
             core.base_currency,
         );
 
+        let client_id = core.client_id;
+
+        let dispatch_state = Arc::new(WsDispatchState::default());
+        let truth_reporter = Arc::new(BinanceFuturesTruthReporter {
+            client_id,
+            account_id: core.account_id,
+            clock,
+            http_client: http_client.clone(),
+            dispatch_state: dispatch_state.clone(),
+            instruments: http_client.instruments_cache(),
+        });
+
         Ok(Self {
             core,
             clock,
             config,
             emitter,
-            dispatch_state: Arc::new(WsDispatchState::default()),
+            dispatch_state,
             product_type,
             http_client,
             ws_client: Arc::new(TokioMutex::new(None)),
@@ -253,6 +442,8 @@ impl BinanceFuturesExecutionClient {
             recovery_task: Mutex::new(None),
             recovery_lock: Arc::new(TokioMutex::new(())),
             recovery_tx: Mutex::new(None),
+            private_stream_health: PrivateStreamHealthHandle::new(client_id),
+            truth_reporter,
             pending_tasks: Mutex::new(Vec::new()),
             is_hedge_mode: AtomicBool::new(false),
         })
@@ -1132,10 +1323,24 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         self.core.cache().account_owned(&self.core.account_id)
     }
 
+    fn correlated_truth_reporter(&self) -> Option<Arc<dyn CorrelatedTruthReporter>> {
+        Some(self.truth_reporter.clone())
+    }
+
+    fn private_stream_health(&self) -> Option<PrivateStreamHealth> {
+        Some(self.private_stream_health.snapshot())
+    }
+
+    fn mark_private_stream_reconciled(&self, generation: u64, ts_now: UnixNanos) -> bool {
+        self.private_stream_health.ready(generation, ts_now)
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.core.is_connected() {
             return Ok(());
         }
+
+        let stream_generation = self.private_stream_health.begin_reconnect();
 
         // Reinitialize cancellation token in case of reconnection
         self.cancellation_token = CancellationToken::new();
@@ -1230,6 +1435,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             use_trade_lite: self.config.use_trade_lite,
             seen_trade_ids,
             cancellation_token: self.cancellation_token.clone(),
+            private_stream_health: self.private_stream_health.clone(),
         });
 
         let ws_build_params = WsBuildParams {
@@ -1241,7 +1447,18 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             transport_backend: self.config.transport_backend,
         };
 
-        let ws_client = build_and_connect_user_stream(&ws_build_params, &listen_key).await?;
+        let ws_client = match build_and_connect_user_stream(&ws_build_params, &listen_key).await {
+            Ok(client) => client,
+            Err(error) => {
+                self.private_stream_health.fail(
+                    stream_generation,
+                    format!("Futures private stream connection failed: {error}"),
+                );
+                return Err(error);
+            }
+        };
+        self.private_stream_health.authenticated(stream_generation);
+        self.private_stream_health.subscribed(stream_generation);
         let stream = ws_client.stream();
         *self.ws_client.lock().await = Some(ws_client);
 
@@ -1259,6 +1476,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             let listen_key_ref = self.listen_key.clone();
             let cancel = self.cancellation_token.clone();
             let recovery_tx = recovery_tx.clone();
+            let private_stream_health = self.private_stream_health.clone();
+            let clock = self.clock;
 
             let keepalive_task = get_runtime().spawn(async move {
                 let mut interval =
@@ -1278,9 +1497,16 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                     Ok(()) => {
                                         log::debug!("Listen key keepalive sent successfully");
                                         consecutive_failures = 0;
+                                        let generation = private_stream_health.current_generation();
+                                        private_stream_health.heartbeat(generation, clock.get_time_ns());
                                     }
                                     Err(e) => {
                                         consecutive_failures += 1;
+                                        let generation = private_stream_health.current_generation();
+                                        private_stream_health.fail(
+                                            generation,
+                                            format!("Futures listen key keepalive failed: {e}"),
+                                        );
                                         log::warn!(
                                             "Listen key keepalive failed ({consecutive_failures}/{MAX_KEEPALIVE_FAILURES}): {e}",
                                         );
@@ -1451,6 +1677,11 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         *self.listen_key.write().expect(MUTEX_POISONED) = None;
 
         self.abort_pending_tasks();
+
+        self.private_stream_health.stale(
+            self.private_stream_health.current_generation(),
+            "Futures private stream disconnected",
+        );
 
         self.core.set_disconnected();
         log::info!("Disconnected: client_id={}", self.core.client_id);

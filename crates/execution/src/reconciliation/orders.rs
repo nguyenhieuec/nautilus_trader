@@ -29,7 +29,7 @@ use nautilus_model::{
         OrderAccepted, OrderCanceled, OrderEventAny, OrderExpired, OrderFilled, OrderRejected,
         OrderTriggered, OrderUpdated,
     },
-    identifiers::{AccountId, PositionId},
+    identifiers::{AccountId, ClientId, PositionId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny, TRIGGERABLE_ORDER_TYPES},
     reports::{FillReport, OrderStatusReport},
@@ -42,6 +42,7 @@ use super::{
     ids::create_inferred_reconciliation_trade_id,
     positions::{cap_price_at_instrument_max, is_within_single_unit_tolerance},
 };
+use crate::anomaly::{FillValidationErrorV1, RejectedOverfillV1};
 
 /// Generates reconciliation events for a live order status report.
 ///
@@ -330,13 +331,18 @@ pub fn generate_external_order_status_events(
 ///
 /// This is used during reconciliation when a fill report is received from the venue.
 /// Returns `None` if the fill is a duplicate or would cause an overfill.
-pub fn reconcile_fill_report(
+///
+/// # Errors
+///
+/// Returns a typed duplicate or rejected-overfill result when the fill is not applied.
+pub fn reconcile_fill_report_strict(
     order: &OrderAny,
     report: &FillReport,
     instrument: &InstrumentAny,
     ts_now: UnixNanos,
     allow_overfills: bool,
-) -> Option<OrderEventAny> {
+    client_id: ClientId,
+) -> Result<Option<OrderEventAny>, FillValidationErrorV1> {
     debug_assert!(
         !report.last_qty.is_zero(),
         "fill report last_qty must be non-zero for {}",
@@ -349,7 +355,7 @@ pub fn reconcile_fill_report(
             report.trade_id,
             order.client_order_id()
         );
-        return None;
+        return Err(FillValidationErrorV1::DuplicateFill);
     }
 
     let potential_filled_qty = order.filled_qty() + report.last_qty;
@@ -363,7 +369,19 @@ pub fn reconcile_fill_report(
                 report.last_qty,
                 potential_filled_qty
             );
-            return None;
+            return Err(FillValidationErrorV1::RejectedOverfill(Box::new(
+                RejectedOverfillV1 {
+                    client_id,
+                    account_id: report.account_id,
+                    instrument_id: report.instrument_id,
+                    client_order_id: order.client_order_id(),
+                    trade_id: report.trade_id,
+                    order_quantity_raw: order.quantity().raw,
+                    prior_filled_raw: order.filled_qty().raw,
+                    rejected_last_quantity_raw: report.last_qty.raw,
+                    observed_at: ts_now,
+                },
+            )));
         }
         log::warn!(
             "Allowing overfill during reconciliation for {}: order.quantity={}, order.filled_qty={}, fill.last_qty={}, will result in filled_qty={}",
@@ -387,7 +405,7 @@ pub fn reconcile_fill_report(
         report.trade_id,
     );
 
-    Some(OrderEventAny::Filled(OrderFilled::new(
+    Ok(Some(OrderEventAny::Filled(OrderFilled::new(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -407,7 +425,30 @@ pub fn reconcile_fill_report(
         true, // reconciliation
         report.venue_position_id,
         Some(report.commission),
-    )))
+    ))))
+}
+
+/// Compatibility wrapper for callers which do not consume typed validation failures.
+///
+/// The execution engine uses [`reconcile_fill_report_strict`] so rejected overfills
+/// cross the synchronous anomaly boundary with the cached originating client ID.
+pub fn reconcile_fill_report(
+    order: &OrderAny,
+    report: &FillReport,
+    instrument: &InstrumentAny,
+    ts_now: UnixNanos,
+    allow_overfills: bool,
+) -> Option<OrderEventAny> {
+    reconcile_fill_report_strict(
+        order,
+        report,
+        instrument,
+        ts_now,
+        allow_overfills,
+        ClientId::from("RECONCILIATION"),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Checks if the order should be updated based on quantity, price, or trigger price

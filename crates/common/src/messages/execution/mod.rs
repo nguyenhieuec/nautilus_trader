@@ -33,10 +33,11 @@ pub use self::{
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
     report::{
-        GenerateExecutionMassStatus, GenerateExecutionMassStatusBuilder, GenerateFillReports,
-        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReportBuilder,
-        GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
-        GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder,
+        CorrelatedTruthReporter, GenerateBinanceTruthReport, GenerateExecutionMassStatus,
+        GenerateExecutionMassStatusBuilder, GenerateFillReports, GenerateFillReportsBuilder,
+        GenerateOrderStatusReport, GenerateOrderStatusReportBuilder, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, TruthReportError,
     },
     submit::{SubmitOrder, SubmitOrderList},
 };

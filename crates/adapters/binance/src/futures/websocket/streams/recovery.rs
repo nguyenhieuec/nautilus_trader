@@ -126,6 +126,7 @@ pub(crate) async fn run_recovery_driver<F>(
                     Some(()) => {
                         // Drain additional pending triggers so we only run once per burst
                         while rx.try_recv().is_ok() {}
+                        ctx.dispatch_ctx.private_stream_health.begin_reconnect();
                         recover_with_retry(&ctx, dispatch_fn.clone(), &cancel).await;
                     }
                     None => {
@@ -238,6 +239,13 @@ where
         dispatch_fn,
     );
     *ctx.ws_task.lock().expect(MUTEX_POISONED) = Some(new_task);
+    let generation = ctx.dispatch_ctx.private_stream_health.current_generation();
+    ctx.dispatch_ctx
+        .private_stream_health
+        .authenticated(generation);
+    ctx.dispatch_ctx
+        .private_stream_health
+        .subscribed(generation);
 
     Ok(())
 }

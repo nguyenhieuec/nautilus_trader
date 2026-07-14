@@ -131,6 +131,7 @@
     )
 )]
 
+pub mod anomaly;
 pub mod client;
 pub mod engine;
 pub mod matching_core;

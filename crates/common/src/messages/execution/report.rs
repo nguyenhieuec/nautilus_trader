@@ -13,12 +13,16 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Display;
+use std::{collections::BTreeSet, fmt::Display};
 
+use async_trait::async_trait;
 use derive_builder::Builder;
 use nautilus_core::{Params, UUID4, UnixNanos};
-use nautilus_model::identifiers::{
-    ClientId, ClientOrderId, InstrumentId, TraderId, Venue, VenueOrderId,
+use nautilus_model::{
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, TraderId, Venue, VenueOrderId,
+    },
+    reports::{BinanceTruthReport, ReportRequestId},
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +30,82 @@ use crate::enums::LogLevel;
 
 const fn default_report_log_level() -> LogLevel {
     LogLevel::Info
+}
+
+/// Request for one identity-correlated Binance safety-truth epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerateBinanceTruthReport {
+    pub request_id: ReportRequestId,
+    pub client_id: ClientId,
+    pub account_id: AccountId,
+    pub exact_order_ids: BTreeSet<ClientOrderId>,
+    pub ts_init: UnixNanos,
+}
+
+/// Typed failure while producing a correlated truth report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TruthReportError {
+    ClientIdMismatch {
+        expected: ClientId,
+        actual: ClientId,
+    },
+    AccountIdMismatch {
+        expected: AccountId,
+        actual: AccountId,
+    },
+    MissingOrderOrigin(ClientOrderId),
+    Account(String),
+    Mode(String),
+    OpenOrders(String),
+    Positions(String),
+    ExactOrder {
+        client_order_id: ClientOrderId,
+        detail: String,
+    },
+}
+
+impl Display for TruthReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientIdMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "client ID mismatch: expected {expected}, received {actual}"
+                )
+            }
+            Self::AccountIdMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "account ID mismatch: expected {expected}, received {actual}"
+                )
+            }
+            Self::MissingOrderOrigin(client_order_id) => {
+                write!(
+                    f,
+                    "missing instrument origin for exact order {client_order_id}"
+                )
+            }
+            Self::Account(detail) => write!(f, "account report failed: {detail}"),
+            Self::Mode(detail) => write!(f, "account mode report failed: {detail}"),
+            Self::OpenOrders(detail) => write!(f, "open-order report failed: {detail}"),
+            Self::Positions(detail) => write!(f, "position report failed: {detail}"),
+            Self::ExactOrder {
+                client_order_id,
+                detail,
+            } => write!(f, "exact order {client_order_id} failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for TruthReportError {}
+
+/// Read-only reporter handle owned by one exact execution client identity.
+#[async_trait]
+pub trait CorrelatedTruthReporter: std::fmt::Debug + Send + Sync {
+    async fn generate_truth_report(
+        &self,
+        request: GenerateBinanceTruthReport,
+    ) -> Result<BinanceTruthReport, TruthReportError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Builder)]

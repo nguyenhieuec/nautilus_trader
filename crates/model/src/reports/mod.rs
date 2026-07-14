@@ -19,12 +19,17 @@
 //! of various trading operations, including order fills, order status, position
 //! status, and mass status requests.
 
+pub mod binance_truth;
 pub mod fill;
 pub mod mass_status;
 pub mod order;
 pub mod position;
 
 // Re-exports
+pub use binance_truth::{
+    BinanceModeProof, BinanceTruthReport, ExactOrderQueryResult, PrivateStreamHealth,
+    PrivateStreamState, ReportRequestId,
+};
 pub use fill::FillReport;
 pub use mass_status::ExecutionMassStatus;
 use nautilus_core::UnixNanos;

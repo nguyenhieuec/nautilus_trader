@@ -28,8 +28,8 @@ use nautilus_model::{
         },
     },
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
-        VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
+        TraderId, VenueOrderId,
     },
     instruments::{
         Instrument, InstrumentAny,
@@ -48,6 +48,7 @@ use rust_decimal_macros::dec;
 use uuid::Uuid;
 
 use super::{ids::*, orders::*, positions::*, types::*};
+use crate::anomaly::FillValidationErrorV1;
 
 #[fixture]
 fn instrument() -> InstrumentAny {
@@ -4807,14 +4808,24 @@ fn test_reconcile_fill_report_overfill_after_partial_rejected(instrument: Instru
         Price::from("1.00000"),
     );
 
-    let result = reconcile_fill_report(
+    let client_id = ClientId::from("BINANCE-SPOT");
+    let result = reconcile_fill_report_strict(
         &order,
         &fill_report,
         &instrument,
         UnixNanos::from(3_000_000),
         false,
+        client_id,
     );
-    assert!(result.is_none(), "expected overfill rejection");
+    let FillValidationErrorV1::RejectedOverfill(anomaly) = result.unwrap_err() else {
+        panic!("expected typed overfill rejection");
+    };
+    assert_eq!(anomaly.client_id, client_id);
+    assert_eq!(anomaly.client_order_id, client_order_id);
+    assert_eq!(anomaly.trade_id, TradeId::from("T-002"));
+    assert_eq!(anomaly.order_quantity_raw, order.quantity().raw);
+    assert_eq!(anomaly.prior_filled_raw, order.filled_qty().raw);
+    assert_eq!(anomaly.rejected_last_quantity_raw, fill_report.last_qty.raw);
 }
 
 #[rstest]

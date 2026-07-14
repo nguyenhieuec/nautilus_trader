@@ -15,7 +15,7 @@
 
 //! Builder for constructing [`LiveNode`] instances.
 
-use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, sync::Arc, time::Duration};
 
 use nautilus_common::{
     cache::CacheConfig,
@@ -32,7 +32,7 @@ use nautilus_common::{
 };
 use nautilus_core::UUID4;
 use nautilus_data::client::DataClientAdapter;
-use nautilus_execution::engine::ExecutionEngine;
+use nautilus_execution::{anomaly::ExecutionAnomalySink, engine::ExecutionEngine};
 use nautilus_model::identifiers::{TraderId, Venue};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_system::{
@@ -93,6 +93,7 @@ pub struct LiveNodeBuilder {
     external_msgbus_factory: Option<Box<dyn MessageBusBackingFactory>>,
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
     external_msgbus_ingress: Option<ExternalMessageBusIngress>,
+    execution_anomaly_sink: Option<Arc<dyn ExecutionAnomalySink>>,
 }
 
 impl Debug for LiveNodeBuilder {
@@ -154,6 +155,7 @@ impl LiveNodeBuilder {
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
+            execution_anomaly_sink: None,
         })
     }
 
@@ -182,6 +184,7 @@ impl LiveNodeBuilder {
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
+            execution_anomaly_sink: None,
         })
     }
 
@@ -272,6 +275,13 @@ impl LiveNodeBuilder {
     #[must_use]
     pub const fn with_delay_shutdown_secs(mut self, delay_secs: u64) -> Self {
         self.config.timeout_shutdown = Duration::from_secs(delay_secs);
+        self
+    }
+
+    /// Installs the synchronous application sink for rejected overfills.
+    #[must_use]
+    pub fn with_execution_anomaly_sink(mut self, sink: Arc<dyn ExecutionAnomalySink>) -> Self {
+        self.execution_anomaly_sink = Some(sink);
         self
     }
 
@@ -496,6 +506,15 @@ impl LiveNodeBuilder {
 
         self.config.validate_runtime_support()?;
 
+        if !self.config.exec_engine.allow_overfills
+            && !self.exec_client_factories.is_empty()
+            && self.execution_anomaly_sink.is_none()
+        {
+            anyhow::bail!(
+                "allow_overfills=false requires LiveNodeBuilder::with_execution_anomaly_sink"
+            );
+        }
+
         if self.config.event_store.is_some() && self.event_store_factory.is_none() {
             anyhow::bail!(
                 "LiveNodeConfig.event_store is set but no factory was registered; \
@@ -521,6 +540,11 @@ impl LiveNodeBuilder {
                 .with_clock_factory(self.clock_factory.take())
                 .with_event_store_factory(self.event_store_factory.take()),
         )?;
+
+        kernel
+            .exec_engine
+            .borrow_mut()
+            .set_execution_anomaly_sink(self.execution_anomaly_sink.take());
 
         self.install_external_msgbus_factory(&kernel)?;
 

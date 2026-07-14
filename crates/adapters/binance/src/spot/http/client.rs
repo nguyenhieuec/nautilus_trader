@@ -1674,6 +1674,19 @@ impl BinanceSpotHttpClient {
         Ok(account_info.to_account_state(account_id, ts_init))
     }
 
+    /// Requests raw account information without dropping product-mode fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the authenticated account request fails or cannot be decoded.
+    pub async fn request_account_info(&self) -> anyhow::Result<BinanceAccountInfo> {
+        let params = AccountInfoParams::default();
+        self.inner
+            .account(&params)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     /// Requests the status of a specific order.
     ///
     /// Either `venue_order_id` or `client_order_id` must be provided.

@@ -16,6 +16,7 @@
 //! Live execution client implementation for the Binance Spot adapter.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,10 +30,11 @@ use nautilus_common::{
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
+        BatchCancelOrders, CancelAllOrders, CancelOrder, CorrelatedTruthReporter,
+        GenerateBinanceTruthReport, GenerateFillReports, GenerateOrderStatusReport,
+        GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TruthReportError,
     },
 };
 use nautilus_core::{
@@ -54,9 +56,98 @@ use nautilus_model::{
     },
     instruments::Instrument,
     orders::{Order, OrderAny},
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{
+        BinanceModeProof, BinanceTruthReport, ExactOrderQueryResult, ExecutionMassStatus,
+        FillReport, OrderStatusReport, PositionStatusReport, PrivateStreamHealth,
+    },
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+
+#[derive(Clone, Debug)]
+struct BinanceSpotTruthReporter {
+    client_id: ClientId,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    http_client: BinanceSpotHttpClient,
+    dispatch_state: Arc<WsDispatchState>,
+}
+
+#[async_trait]
+impl CorrelatedTruthReporter for BinanceSpotTruthReporter {
+    async fn generate_truth_report(
+        &self,
+        request: GenerateBinanceTruthReport,
+    ) -> Result<BinanceTruthReport, TruthReportError> {
+        if request.client_id != self.client_id {
+            return Err(TruthReportError::ClientIdMismatch {
+                expected: self.client_id,
+                actual: request.client_id,
+            });
+        }
+        if request.account_id != self.account_id {
+            return Err(TruthReportError::AccountIdMismatch {
+                expected: self.account_id,
+                actual: request.account_id,
+            });
+        }
+
+        let account_info = self
+            .http_client
+            .request_account_info()
+            .await
+            .map_err(|error| TruthReportError::Account(error.to_string()))?;
+        let balances = account_info
+            .to_account_state(self.account_id, request.ts_init)
+            .balances;
+        let open_orders = self
+            .http_client
+            .request_order_status_reports(self.account_id, None, None, None, true, None)
+            .await
+            .map_err(|error| TruthReportError::OpenOrders(error.to_string()))?;
+
+        let mut exact_orders = BTreeMap::new();
+        for client_order_id in request.exact_order_ids {
+            let instrument_id = self
+                .dispatch_state
+                .order_identities
+                .get(&client_order_id)
+                .map(|identity| identity.instrument_id)
+                .ok_or(TruthReportError::MissingOrderOrigin(client_order_id))?;
+            let exact = self
+                .http_client
+                .request_order_status_report(
+                    self.account_id,
+                    instrument_id,
+                    None,
+                    Some(client_order_id),
+                )
+                .await
+                .map_err(|error| TruthReportError::ExactOrder {
+                    client_order_id,
+                    detail: error.to_string(),
+                })?
+                .map_or(ExactOrderQueryResult::NotFound, |report| {
+                    ExactOrderQueryResult::Found(Box::new(report))
+                });
+            exact_orders.insert(client_order_id, exact);
+        }
+
+        Ok(BinanceTruthReport {
+            request_id: request.request_id,
+            client_id: self.client_id,
+            account_id: self.account_id,
+            mode: BinanceModeProof::Spot {
+                can_trade: account_info.can_trade,
+                account_type: account_info.account_type,
+            },
+            balances,
+            positions: Vec::new(),
+            open_orders,
+            exact_orders,
+            ts_received: self.clock.get_time_ns(),
+        })
+    }
+}
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use ustr::Ustr;
@@ -88,6 +179,7 @@ use crate::{
             parse_required_decimal, parse_required_price_at_precision,
             parse_required_quantity_at_precision,
         },
+        private_stream::PrivateStreamHealthHandle,
     },
     config::BinanceExecClientConfig,
     spot::{
@@ -125,6 +217,8 @@ pub struct BinanceSpotExecutionClient {
     ws_trading_handle: Mutex<Option<JoinHandle<()>>>,
     ws_authenticated: Arc<tokio::sync::Notify>,
     ws_user_data_subscribed: Arc<tokio::sync::Notify>,
+    private_stream_health: PrivateStreamHealthHandle,
+    truth_reporter: Arc<BinanceSpotTruthReporter>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -175,17 +269,30 @@ impl BinanceSpotExecutionClient {
             None
         };
 
+        let client_id = core.client_id;
+
+        let dispatch_state = Arc::new(WsDispatchState::default());
+        let truth_reporter = Arc::new(BinanceSpotTruthReporter {
+            client_id,
+            account_id: core.account_id,
+            clock,
+            http_client: http_client.clone(),
+            dispatch_state: dispatch_state.clone(),
+        });
+
         Ok(Self {
             core,
             clock,
             config,
             emitter,
-            dispatch_state: Arc::new(WsDispatchState::default()),
+            dispatch_state,
             http_client,
             ws_trading_client,
             ws_trading_handle: Mutex::new(None),
             ws_authenticated: Arc::new(tokio::sync::Notify::new()),
             ws_user_data_subscribed: Arc::new(tokio::sync::Notify::new()),
+            private_stream_health: PrivateStreamHealthHandle::new(client_id),
+            truth_reporter,
             pending_tasks: Mutex::new(Vec::new()),
         })
     }
@@ -496,7 +603,9 @@ impl BinanceSpotExecutionClient {
         &mut self,
         mut ws_trading: BinanceSpotWsTradingClient,
         reason: &str,
-    ) {
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        self.private_stream_health.fail(generation, reason);
         log::error!(
             "{reason}; entering Spot HTTP-only execution mode. Order commands use HTTP responses; execution reconciliation requires explicit queries until WS trading is re-enabled"
         );
@@ -506,6 +615,12 @@ impl BinanceSpotExecutionClient {
         }
         ws_trading.disconnect().await;
         self.ws_trading_client = Some(ws_trading);
+
+        if self.config.require_ws_trading {
+            anyhow::bail!("required Spot private WebSocket failed: {reason}");
+        }
+
+        Ok(())
     }
 }
 
@@ -535,9 +650,31 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         self.core.cache().account_owned(&self.core.account_id)
     }
 
+    fn correlated_truth_reporter(&self) -> Option<Arc<dyn CorrelatedTruthReporter>> {
+        Some(self.truth_reporter.clone())
+    }
+
+    fn private_stream_health(&self) -> Option<PrivateStreamHealth> {
+        Some(self.private_stream_health.snapshot())
+    }
+
+    fn mark_private_stream_reconciled(&self, generation: u64, ts_now: UnixNanos) -> bool {
+        self.private_stream_health.ready(generation, ts_now)
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         if self.core.is_connected() {
             return Ok(());
+        }
+
+        let stream_generation = self.private_stream_health.begin_reconnect();
+
+        if self.config.require_ws_trading && self.ws_trading_client.is_none() {
+            self.private_stream_health.fail(
+                stream_generation,
+                "require_ws_trading=true but use_ws_trading=false",
+            );
+            anyhow::bail!("require_ws_trading=true requires use_ws_trading=true");
         }
 
         // Load instruments if not already done
@@ -592,6 +729,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     let treat_expired_as_canceled = self.config.treat_expired_as_canceled;
                     let ws_authenticated = self.ws_authenticated.clone();
                     let ws_user_data_subscribed = self.ws_user_data_subscribed.clone();
+                    let private_stream_health = self.private_stream_health.clone();
                     let (ws_setup_error_tx, mut ws_setup_error_rx) =
                         tokio::sync::mpsc::unbounded_channel();
                     let seen_trade_ids = std::sync::Arc::new(Mutex::new(FifoCache::new()));
@@ -600,6 +738,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         loop {
                             match ws_trading_clone.recv().await {
                                 Some(msg) => {
+                                    private_stream_health
+                                        .heartbeat(stream_generation, clock.get_time_ns());
+                                    if matches!(&msg, BinanceSpotWsTradingMessage::Reconnected) {
+                                        private_stream_health.stale(
+                                            stream_generation,
+                                            "Spot private WebSocket reconnected; reconciliation required",
+                                        );
+                                    }
                                     dispatch_ws_trading_message(
                                         msg,
                                         &emitter,
@@ -615,6 +761,10 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                                     );
                                 }
                                 None => {
+                                    private_stream_health.fail(
+                                        stream_generation,
+                                        "Spot private dispatch loop ended",
+                                    );
                                     log::warn!("WS trading dispatch loop ended");
                                     break;
                                 }
@@ -626,8 +776,8 @@ impl ExecutionClient for BinanceSpotExecutionClient {
 
                     if let Err(e) = ws_trading.session_logon().await {
                         let reason = format!("WS session logon failed: {e}");
-                        self.enter_http_only_execution_mode(ws_trading, &reason)
-                            .await;
+                        self.enter_http_only_execution_mode(ws_trading, &reason, stream_generation)
+                            .await?;
                     } else {
                         let auth_result = wait_for_ws_setup_response(
                             Duration::from_secs(10),
@@ -638,13 +788,23 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                         .await;
 
                         if let Err(e) = auth_result {
-                            self.enter_http_only_execution_mode(ws_trading, &e.to_string())
-                                .await;
+                            self.enter_http_only_execution_mode(
+                                ws_trading,
+                                &e.to_string(),
+                                stream_generation,
+                            )
+                            .await?;
                         } else if let Err(e) = ws_trading.subscribe_user_data().await {
+                            self.private_stream_health.authenticated(stream_generation);
                             let reason = format!("WS user data subscribe failed: {e}");
-                            self.enter_http_only_execution_mode(ws_trading, &reason)
-                                .await;
+                            self.enter_http_only_execution_mode(
+                                ws_trading,
+                                &reason,
+                                stream_generation,
+                            )
+                            .await?;
                         } else {
+                            self.private_stream_health.authenticated(stream_generation);
                             let subscribe_result = wait_for_ws_setup_response(
                                 Duration::from_secs(10),
                                 self.ws_user_data_subscribed.notified(),
@@ -654,9 +814,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             .await;
 
                             if let Err(e) = subscribe_result {
-                                self.enter_http_only_execution_mode(ws_trading, &e.to_string())
-                                    .await;
+                                self.enter_http_only_execution_mode(
+                                    ws_trading,
+                                    &e.to_string(),
+                                    stream_generation,
+                                )
+                                .await?;
                             } else {
+                                self.private_stream_health.subscribed(stream_generation);
                                 self.ws_trading_client = Some(ws_trading);
                             }
                         }
@@ -664,10 +829,17 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 }
                 Err(e) => {
                     let reason = format!("Failed to connect WS trading API: {e}");
-                    self.enter_http_only_execution_mode(ws_trading, &reason)
-                        .await;
+                    self.enter_http_only_execution_mode(ws_trading, &reason, stream_generation)
+                        .await?;
                 }
             }
+        }
+
+        let stream_health = self.private_stream_health.snapshot();
+        if self.config.require_ws_trading
+            && (!stream_health.authenticated || !stream_health.subscribed)
+        {
+            anyhow::bail!("required Spot private WebSocket is not ready");
         }
 
         self.core.set_connected();
@@ -690,6 +862,11 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         }
 
         self.abort_pending_tasks();
+
+        self.private_stream_health.stale(
+            self.private_stream_health.current_generation(),
+            "Spot execution client disconnected",
+        );
 
         self.core.set_disconnected();
         log::info!("Disconnected: client_id={}", self.core.client_id);

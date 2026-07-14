@@ -61,6 +61,7 @@ use crate::{
             parse_required_price_at_precision, parse_required_quantity_at_precision,
             price_at_precision, quantity_at_precision,
         },
+        private_stream::PrivateStreamHealthHandle,
         symbol::format_instrument_id,
     },
     futures::{
@@ -86,6 +87,7 @@ pub(crate) struct DispatchCtx {
     pub use_trade_lite: bool,
     pub seen_trade_ids: Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>>,
     pub cancellation_token: CancellationToken,
+    pub private_stream_health: PrivateStreamHealthHandle,
 }
 
 /// Spawns the user data stream dispatch task. The task consumes `stream` and
@@ -104,6 +106,8 @@ where
         + 'static,
 {
     let cancel = ctx.cancellation_token.clone();
+    let private_stream_health = ctx.private_stream_health.clone();
+    let stream_generation = private_stream_health.current_generation();
 
     get_runtime().spawn(async move {
         pin_mut!(stream);
@@ -116,8 +120,16 @@ where
                     // relies on this to flush events queued on the old stream
                     // before the new dispatcher takes over.
                     match msg {
-                        Some(message) => dispatch_fn(message, ctx.as_ref(), &recovery_tx),
+                        Some(message) => {
+                            private_stream_health
+                                .heartbeat(stream_generation, ctx.clock.get_time_ns());
+                            dispatch_fn(message, ctx.as_ref(), &recovery_tx);
+                        }
                         None => {
+                            private_stream_health.fail(
+                                stream_generation,
+                                "Futures private dispatch loop ended",
+                            );
                             log::debug!("WS dispatch stream ended");
                             break;
                         }

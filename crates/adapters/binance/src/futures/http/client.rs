@@ -2212,6 +2212,18 @@ impl BinanceFuturesHttpClient {
         account_info.to_account_state(account_id, ts_init)
     }
 
+    /// Requests raw account information without dropping account-mode fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the authenticated account request fails or cannot be decoded.
+    pub async fn request_account_info(&self) -> anyhow::Result<BinanceFuturesAccountInfo> {
+        self.inner
+            .query_account()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     /// Requests a single order status report.
     ///
     /// Either `venue_order_id` or `client_order_id` must be provided.

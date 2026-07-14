@@ -77,12 +77,13 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{error::Error, fmt::Debug, future::Future, pin::Pin, time::Duration};
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     actor::{Actor, DataActor, DataActorNative},
     cache::database::CacheDatabaseAdapter,
+    clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
     live::dst,
@@ -90,7 +91,10 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport,
         data::DataCommand,
-        execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
+        execution::{
+            CorrelatedTruthReporter, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            TradingCommand,
+        },
     },
     msgbus::{self, BusMessage},
     timer::TimeEventHandler,
@@ -101,9 +105,9 @@ use nautilus_core::{
 };
 use nautilus_model::{
     events::OrderEventAny,
-    identifiers::{ClientOrderId, TraderId, Venue},
+    identifiers::{ClientId, ClientOrderId, TraderId, Venue},
     orders::Order,
-    reports::{OrderStatusReport, PositionStatusReport},
+    reports::{OrderStatusReport, PositionStatusReport, PrivateStreamHealth},
 };
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
 use nautilus_trading::{
@@ -133,6 +137,48 @@ pub use builder::LiveNodeBuilder;
 use config::{LiveNodeConfig, PluginConfig};
 use state::EngineConnectionStatus;
 pub use state::{LiveNodeHandle, NodeState};
+
+/// Client-scoped reason startup reconciliation could not establish readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupReconciliationFailureKind {
+    TimedOut,
+    MissingMassStatus,
+    QueryFailed,
+    PrivateStreamUnhealthy,
+}
+
+/// One failed client in a strict startup reconciliation result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupReconciliationFailure {
+    pub client_id: ClientId,
+    pub kind: StartupReconciliationFailureKind,
+    pub detail: String,
+}
+
+/// Complete observable result of a startup reconciliation attempt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartupReconciliationResult {
+    pub reconciled_clients: IndexSet<ClientId>,
+    pub failed_clients: IndexMap<ClientId, StartupReconciliationFailure>,
+}
+
+/// Strict startup reconciliation failure containing every client outcome observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupReconciliationError {
+    pub result: StartupReconciliationResult,
+}
+
+impl std::fmt::Display for StartupReconciliationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "startup reconciliation failed for {} client(s)",
+            self.result.failed_clients.len()
+        )
+    }
+}
+
+impl Error for StartupReconciliationError {}
 
 /// High-level abstraction for a live Nautilus system node.
 ///
@@ -164,6 +210,31 @@ pub struct LiveNode {
 }
 
 impl LiveNode {
+    /// Returns the read-only truth reporter bound to one exact execution client.
+    #[must_use]
+    pub fn correlated_truth_reporter(
+        &self,
+        client_id: ClientId,
+    ) -> Option<std::sync::Arc<dyn CorrelatedTruthReporter>> {
+        self.exec_clients
+            .iter()
+            .find(|client| client.client_id() == client_id)
+            .and_then(ExecutionClient::correlated_truth_reporter)
+    }
+
+    /// Returns a client-indexed snapshot of all exposed private streams.
+    #[must_use]
+    pub fn private_stream_health(&self) -> IndexMap<ClientId, PrivateStreamHealth> {
+        self.exec_clients
+            .iter()
+            .filter_map(|client| {
+                client
+                    .private_stream_health()
+                    .map(|health| (client.client_id(), health))
+            })
+            .collect()
+    }
+
     /// Creates a new `LiveNode` from builder components.
     ///
     /// This is an internal constructor used by `LiveNodeBuilder`.
@@ -571,10 +642,13 @@ impl LiveNode {
     ///
     /// Returns an error if reconciliation fails or times out.
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
-    async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+    async fn perform_startup_reconciliation(
+        &mut self,
+    ) -> Result<StartupReconciliationResult, StartupReconciliationError> {
+        let mut strict_result = StartupReconciliationResult::default();
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
-            return Ok(());
+            return Ok(strict_result);
         }
 
         log_info!(
@@ -593,10 +667,17 @@ impl LiveNode {
         let client_ids = self.kernel.exec_engine.borrow().client_ids();
 
         for client_id in client_ids {
-            if start.elapsed() > timeout {
-                log::warn!("Reconciliation timeout reached, stopping early");
-                break;
-            }
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                strict_result.failed_clients.insert(
+                    client_id,
+                    StartupReconciliationFailure {
+                        client_id,
+                        kind: StartupReconciliationFailureKind::TimedOut,
+                        detail: "global startup reconciliation deadline elapsed".to_string(),
+                    },
+                );
+                continue;
+            };
 
             log_info!(
                 "Requesting mass status from {}...",
@@ -604,15 +685,17 @@ impl LiveNode {
                 color = LogColor::Blue
             );
 
-            let mass_status_result = self
-                .kernel
-                .exec_engine
-                .borrow_mut()
-                .generate_mass_status(&client_id, lookback_mins)
-                .await;
+            let mass_status_result = dst::time::timeout(remaining, async {
+                self.kernel
+                    .exec_engine
+                    .borrow_mut()
+                    .generate_mass_status(&client_id, lookback_mins)
+                    .await
+            })
+            .await;
 
             match mass_status_result {
-                Ok(Some(mass_status)) => {
+                Ok(Ok(Some(mass_status))) => {
                     log_info!(
                         "Reconciling ExecutionMassStatus for {}",
                         client_id,
@@ -657,17 +740,75 @@ impl LiveNode {
                             }
                         }
                     }
+
+                    let stream_ready = self
+                        .exec_clients
+                        .iter()
+                        .find(|client| client.client_id() == client_id)
+                        .and_then(ExecutionClient::private_stream_health)
+                        .is_none_or(|health| {
+                            self.exec_clients
+                                .iter()
+                                .find(|client| client.client_id() == client_id)
+                                .is_some_and(|client| {
+                                    client.mark_private_stream_reconciled(
+                                        health.generation,
+                                        self.kernel.clock.borrow().timestamp_ns(),
+                                    )
+                                })
+                        });
+
+                    if stream_ready {
+                        strict_result.reconciled_clients.insert(client_id);
+                    } else {
+                        strict_result.failed_clients.insert(
+                            client_id,
+                            StartupReconciliationFailure {
+                                client_id,
+                                kind: StartupReconciliationFailureKind::PrivateStreamUnhealthy,
+                                detail: "private stream generation was not authenticated and reconciling"
+                                    .to_string(),
+                            },
+                        );
+                    }
                 }
-                Ok(None) => {
-                    log::warn!(
-                        "No mass status available from {client_id} \
-                         (likely adapter error when generating reports)"
+                Ok(Ok(None)) => {
+                    strict_result.failed_clients.insert(
+                        client_id,
+                        StartupReconciliationFailure {
+                            client_id,
+                            kind: StartupReconciliationFailureKind::MissingMassStatus,
+                            detail: "execution client returned no mass status".to_string(),
+                        },
                     );
                 }
-                Err(e) => {
-                    log::warn!("Failed to get mass status from {client_id}: {e}");
+                Ok(Err(error)) => {
+                    strict_result.failed_clients.insert(
+                        client_id,
+                        StartupReconciliationFailure {
+                            client_id,
+                            kind: StartupReconciliationFailureKind::QueryFailed,
+                            detail: error.to_string(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    strict_result.failed_clients.insert(
+                        client_id,
+                        StartupReconciliationFailure {
+                            client_id,
+                            kind: StartupReconciliationFailureKind::TimedOut,
+                            detail: error.to_string(),
+                        },
+                    );
                 }
             }
+        }
+
+        if !strict_result.failed_clients.is_empty() {
+            return Err(StartupReconciliationError {
+                result: strict_result,
+            });
         }
 
         self.kernel.portfolio.borrow_mut().initialize_orders();
@@ -680,7 +821,7 @@ impl LiveNode {
             color = LogColor::Blue
         );
 
-        Ok(())
+        Ok(strict_result)
     }
 
     /// Run the live node with automatic shutdown handling.
@@ -1035,9 +1176,17 @@ impl LiveNode {
                     }
                 }, if open_order_report_task.is_some() => {
                     open_order_report_task = None;
+                    if !result.query.failed_clients.is_empty() {
+                        log::error!(
+                            "Open-order reconciliation failed for client(s): {:?}",
+                            result.query.failed_clients.keys().collect::<Vec<_>>()
+                        );
+                        self.initiate_shutdown();
+                        continue;
+                    }
                     let events = self
                         .exec_manager
-                        .reconcile_open_order_reports(&result.check, result.reports);
+                        .reconcile_open_order_reports(&result.check, result.query.reports);
                     self.process_reconciliation_events(&events);
                 }
                 result = async {
@@ -1047,10 +1196,18 @@ impl LiveNode {
                     }
                 }, if position_report_task.is_some() => {
                     position_report_task = None;
+                    if !result.query.failed_clients.is_empty() {
+                        log::error!(
+                            "Position reconciliation failed for client(s): {:?}",
+                            result.query.failed_clients.keys().collect::<Vec<_>>()
+                        );
+                        self.initiate_shutdown();
+                        continue;
+                    }
                     let events = self.exec_manager.reconcile_position_reports(
                         &result.check,
-                        result.reports,
-                        &result.failed_venues,
+                        result.query.reports,
+                        &IndexSet::new(),
                     );
                     self.process_reconciliation_events(&events);
                 }
@@ -1745,8 +1902,8 @@ impl LiveNode {
 
         Some(OpenOrderReportTask {
             future: Box::pin(async move {
-                let reports = request_open_order_reports(clients, command).await;
-                OpenOrderReportResult { check, reports }
+                let query = request_open_order_reports(clients, command).await;
+                OpenOrderReportResult { check, query }
             }),
         })
     }
@@ -1765,12 +1922,8 @@ impl LiveNode {
 
         Some(PositionReportTask {
             future: Box::pin(async move {
-                let result = request_position_reports(clients, command).await;
-                PositionReportResult {
-                    check,
-                    reports: result.reports,
-                    failed_venues: result.failed_venues,
-                }
+                let query = request_position_reports(clients, command).await;
+                PositionReportResult { check, query }
             }),
         })
     }
@@ -1785,27 +1938,59 @@ async fn recv_external_msgbus_message(
     }
 }
 
+/// One recurring report-query failure retained by explicit client identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientReportFailure {
+    pub client_id: ClientId,
+    pub venue: Venue,
+    pub detail: String,
+}
+
+/// Typed recurring open-order query result.
+#[derive(Clone, Debug, Default)]
+pub struct OpenOrderReportQueryResult {
+    pub reports: Vec<OrderStatusReport>,
+    pub failed_clients: IndexMap<ClientId, ClientReportFailure>,
+}
+
+/// Typed recurring position query result.
+#[derive(Clone, Debug, Default)]
+pub struct PositionReportQueryResult {
+    pub reports: Vec<PositionStatusReport>,
+    pub failed_clients: IndexMap<ClientId, ClientReportFailure>,
+}
+
 async fn request_open_order_reports(
     clients: Vec<LiveExecutionClient>,
     command: GenerateOrderStatusReports,
-) -> Vec<OrderStatusReport> {
+) -> OpenOrderReportQueryResult {
     let mut all_reports = Vec::new();
+    let mut failed_clients = IndexMap::new();
 
     for client in clients {
+        let client_id = client.client_id();
         match client.generate_order_status_reports(&command).await {
             Ok(reports) => {
                 all_reports.extend(reports);
             }
             Err(e) => {
-                log::warn!(
-                    "Failed to generate order status reports from {}: {e}",
-                    client.client_id()
+                failed_clients.insert(
+                    client_id,
+                    ClientReportFailure {
+                        client_id,
+                        venue: client.venue(),
+                        detail: e.to_string(),
+                    },
                 );
+                log::warn!("Failed to generate order status reports from {client_id}: {e}");
             }
         }
     }
 
-    all_reports
+    OpenOrderReportQueryResult {
+        reports: all_reports,
+        failed_clients,
+    }
 }
 
 async fn request_position_reports(
@@ -1813,27 +1998,32 @@ async fn request_position_reports(
     command: GeneratePositionStatusReports,
 ) -> PositionReportQueryResult {
     let mut all_reports = Vec::new();
-    let mut failed_venues = IndexSet::new();
+    let mut failed_clients = IndexMap::new();
 
     for client in clients {
+        let client_id = client.client_id();
         let venue = client.venue();
         match client.generate_position_status_reports(&command).await {
             Ok(reports) => {
                 all_reports.extend(reports);
             }
             Err(e) => {
-                failed_venues.insert(venue);
-                log::warn!(
-                    "Failed to generate position status reports from {}: {e}",
-                    client.client_id()
+                failed_clients.insert(
+                    client_id,
+                    ClientReportFailure {
+                        client_id,
+                        venue,
+                        detail: e.to_string(),
+                    },
                 );
+                log::warn!("Failed to generate position status reports from {client_id}: {e}");
             }
         }
     }
 
     PositionReportQueryResult {
         reports: all_reports,
-        failed_venues,
+        failed_clients,
     }
 }
 
@@ -1867,7 +2057,7 @@ struct OpenOrderReportTask {
 
 struct OpenOrderReportResult {
     check: OpenOrderReportCheck,
-    reports: Vec<OrderStatusReport>,
+    query: OpenOrderReportQueryResult,
 }
 
 type PositionReportFuture = Pin<Box<dyn Future<Output = PositionReportResult>>>;
@@ -1878,13 +2068,7 @@ struct PositionReportTask {
 
 struct PositionReportResult {
     check: PositionReportCheck,
-    reports: Vec<PositionStatusReport>,
-    failed_venues: IndexSet<Venue>,
-}
-
-struct PositionReportQueryResult {
-    reports: Vec<PositionStatusReport>,
-    failed_venues: IndexSet<Venue>,
+    query: PositionReportQueryResult,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers
