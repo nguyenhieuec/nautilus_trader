@@ -125,6 +125,8 @@ pub struct ExecutionEngine {
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
     default_client: Option<ExecutionClientAdapter>,
     routing_map: HashMap<Venue, ClientId>,
+    explicit_only_clients: HashSet<ClientId>,
+    instrument_origins: HashMap<InstrumentId, ClientId>,
     oms_overrides: HashMap<StrategyId, OmsType>,
     external_order_claims: HashMap<InstrumentId, StrategyId>,
     external_clients: HashSet<ClientId>,
@@ -159,6 +161,8 @@ impl ExecutionEngine {
             clients: IndexMap::new(),
             default_client: None,
             routing_map: HashMap::new(),
+            explicit_only_clients: HashSet::new(),
+            instrument_origins: HashMap::new(),
             oms_overrides: HashMap::new(),
             external_order_claims: HashMap::new(),
             external_clients: config
@@ -275,6 +279,36 @@ impl ExecutionEngine {
         log::info!("Subscribed to instrument updates for venue {venue}");
     }
 
+    /// Subscribes one execution client to instruments tagged with the matching data-client origin.
+    pub fn subscribe_client_instruments(engine: &Rc<RefCell<Self>>, client_id: ClientId) {
+        let weak = WeakCell::from(Rc::downgrade(engine));
+        let pattern = format!("data.instrument_origin.{client_id}.*");
+
+        let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
+            if let Some(rc) = weak.upgrade() {
+                let instrument_id = instrument.id();
+                let mut engine = rc.borrow_mut();
+
+                if let Some(existing) = engine.instrument_origins.get(&instrument_id)
+                    && *existing != client_id
+                {
+                    log::error!(
+                        "CLIENT_INSTRUMENT_ORIGIN_MISMATCH: client_id={client_id}, origin_client_id={existing}, instrument_id={instrument_id}"
+                    );
+                    return;
+                }
+
+                engine.instrument_origins.insert(instrument_id, client_id);
+                if let Some(adapter) = engine.get_client_adapter_mut(&client_id) {
+                    adapter.on_instrument(instrument.clone());
+                }
+            }
+        });
+
+        msgbus::subscribe_instruments(pattern.into(), handler, None);
+        log::info!("Subscribed execution client {client_id} to origin-tagged instruments");
+    }
+
     #[must_use]
     /// Returns the position ID count for the specified strategy.
     pub fn position_id_count(&self, strategy_id: StrategyId) -> usize {
@@ -378,7 +412,12 @@ impl ExecutionEngine {
         let client_id = client.client_id();
         let venue = client.venue();
 
-        if self.clients.contains_key(&client_id) {
+        if self.clients.contains_key(&client_id)
+            || self
+                .default_client
+                .as_ref()
+                .is_some_and(|default| default.client_id == client_id)
+        {
             anyhow::bail!("Client already registered with ID {client_id}");
         }
 
@@ -394,6 +433,100 @@ impl ExecutionEngine {
         self.routing_map.insert(venue, client_id);
         log::debug!("Registered client {client_id}");
         self.clients.insert(client_id, adapter);
+        Ok(())
+    }
+
+    /// Registers an execution client without adding a venue fallback route.
+    ///
+    /// All commands for this client must carry its explicit client ID and a matching instrument
+    /// origin recorded from the paired data client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client ID is already registered.
+    pub fn register_client_explicit_only(
+        &mut self,
+        client: Box<dyn ExecutionClient>,
+    ) -> anyhow::Result<()> {
+        self.register_client_with_routing(client, Some(Vec::new()))
+    }
+
+    /// Registers a client using configured venue routing semantics.
+    ///
+    /// `None` preserves the legacy factory-venue route, an empty vector is explicit-only, and a
+    /// nonempty vector registers only the listed venue routes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate client IDs or conflicting venue routes.
+    pub fn register_client_with_routing(
+        &mut self,
+        client: Box<dyn ExecutionClient>,
+        venues: Option<Vec<Venue>>,
+    ) -> anyhow::Result<()> {
+        let Some(venues) = venues else {
+            return self.register_client(client);
+        };
+
+        let client_id = client.client_id();
+        if self.clients.contains_key(&client_id)
+            || self
+                .default_client
+                .as_ref()
+                .is_some_and(|default| default.client_id == client_id)
+        {
+            anyhow::bail!("Client already registered with ID {client_id}");
+        }
+
+        for venue in &venues {
+            if let Some(existing_client_id) = self.routing_map.get(venue) {
+                anyhow::bail!(
+                    "Venue {venue} already routed to {existing_client_id}, cannot register {client_id} for the same venue"
+                );
+            }
+        }
+
+        self.clients
+            .insert(client_id, ExecutionClientAdapter::new(client));
+        if venues.is_empty() {
+            self.explicit_only_clients.insert(client_id);
+            log::debug!("Registered explicit-only client {client_id}");
+        } else {
+            for venue in venues {
+                self.routing_map.insert(venue, client_id);
+            }
+            log::debug!("Registered routed client {client_id}");
+        }
+        Ok(())
+    }
+
+    /// Records the paired data-client origin for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown client or a conflicting existing origin.
+    pub fn register_instrument_origin(
+        &mut self,
+        instrument_id: InstrumentId,
+        client_id: ClientId,
+    ) -> anyhow::Result<()> {
+        if !self.clients.contains_key(&client_id)
+            && self
+                .default_client
+                .as_ref()
+                .is_none_or(|default| default.client_id != client_id)
+        {
+            anyhow::bail!("Unknown instrument origin client {client_id}");
+        }
+        if let Some(existing) = self.instrument_origins.get(&instrument_id)
+            && *existing != client_id
+        {
+            anyhow::bail!(
+                "CLIENT_INSTRUMENT_ORIGIN_MISMATCH: client_id={client_id}, origin_client_id={existing}, instrument_id={instrument_id}"
+            );
+        }
+
+        self.instrument_origins.insert(instrument_id, client_id);
         Ok(())
     }
 
@@ -475,6 +608,51 @@ impl ExecutionEngine {
                 ts_init,
             );
         }
+    }
+
+    /// Registers an external order with one explicit execution client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client is unknown or disagrees with the instrument origin.
+    pub fn register_external_order_for_client(
+        &self,
+        client_id: ClientId,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let client = self.clients.get(&client_id).or_else(|| {
+            self.default_client
+                .as_ref()
+                .filter(|default| default.client_id == client_id)
+        });
+        let client =
+            client.ok_or_else(|| anyhow::anyhow!("Unknown execution client {client_id}"))?;
+        let origin_client_id = self.instrument_origins.get(&instrument_id).copied();
+        if self.explicit_only_clients.contains(&client_id) && origin_client_id.is_none() {
+            anyhow::bail!(
+                "CLIENT_INSTRUMENT_ORIGIN_UNKNOWN: client_id={client_id}, instrument_id={instrument_id}"
+            );
+        }
+        if let Some(origin_client_id) = origin_client_id
+            && origin_client_id != client_id
+        {
+            anyhow::bail!(
+                "CLIENT_INSTRUMENT_ORIGIN_MISMATCH: client_id={client_id}, origin_client_id={origin_client_id}, instrument_id={instrument_id}"
+            );
+        }
+
+        client.register_external_order(
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            strategy_id,
+            ts_init,
+        );
+        Ok(())
     }
 
     #[must_use]
@@ -639,6 +817,9 @@ impl ExecutionEngine {
             // Remove from routing map if present
             self.routing_map
                 .retain(|_, mapped_id| mapped_id != &client_id);
+            self.explicit_only_clients.remove(&client_id);
+            self.instrument_origins
+                .retain(|_, origin_client_id| *origin_client_id != client_id);
             log::info!("Deregistered client {client_id}");
             Ok(())
         } else {
@@ -971,6 +1152,23 @@ impl ExecutionEngine {
                 Vec::new()
             }
         };
+
+        let restored_origins: Vec<(InstrumentId, ClientId)> = {
+            let cache = self.cache.borrow();
+            cache
+                .orders(None, None, None, None, None)
+                .into_iter()
+                .filter_map(|order| {
+                    cache
+                        .client_id(&order.client_order_id())
+                        .copied()
+                        .map(|client_id| (order.instrument_id(), client_id))
+                })
+                .collect()
+        };
+        for (instrument_id, client_id) in restored_origins {
+            self.register_instrument_origin(instrument_id, client_id)?;
+        }
 
         for (instrument_id, own_order) in own_book_entries {
             let mut own_book = self.get_or_init_own_order_book(&instrument_id);
@@ -1944,6 +2142,12 @@ impl ExecutionEngine {
             return;
         }
 
+        if let Err(reason) = self.validate_command_origin(&command) {
+            log::error!("{reason}: command={command:?}");
+            self.deny_routing_command(&command, &reason);
+            return;
+        }
+
         let client = if let Some(adapter) = self.find_client_for_command(&command) {
             adapter.client.as_ref()
         } else {
@@ -2018,10 +2222,12 @@ impl ExecutionEngine {
     }
 
     fn find_client_for_command(&self, command: &TradingCommand) -> Option<&ExecutionClientAdapter> {
-        if let Some(client_id) = command.client_id()
-            && let Some(adapter) = self.clients.get(&client_id)
-        {
-            return Some(adapter);
+        if let Some(client_id) = command.client_id() {
+            return self.clients.get(&client_id).or_else(|| {
+                self.default_client
+                    .as_ref()
+                    .filter(|default| default.client_id == client_id)
+            });
         }
 
         if let Some(account_id) = self.account_id_for_command(command) {
@@ -2047,6 +2253,73 @@ impl ExecutionEngine {
         }
 
         self.default_client.as_ref()
+    }
+
+    fn validate_command_origin(&self, command: &TradingCommand) -> Result<(), String> {
+        let Some(instrument_id) = Self::instrument_id_for_command(command) else {
+            return Ok(());
+        };
+
+        let Some(requested_client_id) = command.client_id() else {
+            let explicit_matches = self
+                .explicit_only_clients
+                .iter()
+                .filter(|client_id| {
+                    self.clients
+                        .get(*client_id)
+                        .is_some_and(|client| client.venue() == instrument_id.venue)
+                })
+                .count();
+            if explicit_matches > 0 {
+                return Err(format!(
+                    "AMBIGUOUS_BINANCE_PRODUCT: instrument_id={instrument_id}, client_id required"
+                ));
+            }
+            return Ok(());
+        };
+
+        let Some(origin_client_id) = self.instrument_origins.get(&instrument_id).copied() else {
+            if self.explicit_only_clients.contains(&requested_client_id) {
+                return Err(format!(
+                    "CLIENT_INSTRUMENT_ORIGIN_UNKNOWN: client_id={requested_client_id}, instrument_id={instrument_id}"
+                ));
+            }
+            return Ok(());
+        };
+
+        if origin_client_id != requested_client_id {
+            return Err(format!(
+                "CLIENT_INSTRUMENT_ORIGIN_MISMATCH: client_id={requested_client_id}, origin_client_id={origin_client_id}, instrument_id={instrument_id}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn deny_routing_command(&self, command: &TradingCommand, reason: &str) {
+        match command {
+            TradingCommand::SubmitOrder(cmd) => {
+                let order = {
+                    self.cache
+                        .borrow()
+                        .order(&cmd.client_order_id)
+                        .map(|order| order.clone())
+                };
+                if let Some(order) = order {
+                    self.deny_order(&order, reason);
+                }
+            }
+            TradingCommand::SubmitOrderList(cmd) => {
+                let orders: Vec<OrderAny> = self
+                    .cache
+                    .borrow()
+                    .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+                for order in &orders {
+                    self.deny_order(order, reason);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn account_id_for_command(&self, command: &TradingCommand) -> Option<AccountId> {

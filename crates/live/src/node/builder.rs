@@ -33,7 +33,7 @@ use nautilus_common::{
 use nautilus_core::UUID4;
 use nautilus_data::client::DataClientAdapter;
 use nautilus_execution::engine::ExecutionEngine;
-use nautilus_model::identifiers::TraderId;
+use nautilus_model::identifiers::{TraderId, Venue};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_system::{
     clock_factory::ClockFactory,
@@ -44,7 +44,10 @@ use nautilus_system::{
 
 use super::{
     LiveNode,
-    config::{LiveDataEngineConfig, LiveExecEngineConfig, LiveNodeConfig, LiveRiskEngineConfig},
+    config::{
+        LiveDataEngineConfig, LiveExecEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
+        RoutingConfig,
+    },
 };
 use crate::{
     execution::{
@@ -532,6 +535,13 @@ impl LiveNodeBuilder {
             if let Some(config) = self.data_client_configs.remove(&name) {
                 log::debug!("Creating data client {name}");
 
+                let routing = self
+                    .config
+                    .data_clients
+                    .get(&name)
+                    .map(|client| client.routing.clone())
+                    .unwrap_or_default();
+
                 let client = factory.create(
                     &name,
                     config.as_ref(),
@@ -547,10 +557,17 @@ impl LiveNodeBuilder {
                     client,
                 );
 
-                kernel
-                    .data_engine
-                    .borrow_mut()
-                    .register_client(adapter, venue);
+                let mut data_engine = kernel.data_engine.borrow_mut();
+                if routing.default {
+                    data_engine.register_default_client(adapter);
+                } else if let Some(venues) = configured_venues(&routing) {
+                    data_engine.register_client_explicit_only(adapter)?;
+                    for venue in venues {
+                        data_engine.register_venue_routing(client_id, venue)?;
+                    }
+                } else {
+                    data_engine.register_client(adapter, venue);
+                }
 
                 log::info!("Registered DataClient-{client_id}");
             } else {
@@ -564,6 +581,13 @@ impl LiveNodeBuilder {
             if let Some(config) = self.exec_client_configs.remove(&name) {
                 log::debug!("Creating execution client {name}");
 
+                let routing = self
+                    .config
+                    .exec_clients
+                    .get(&name)
+                    .map(|client| client.routing.clone())
+                    .unwrap_or_default();
+
                 let client = match factory {
                     ExecutionClientFactoryEntry::Adapter(factory) => {
                         factory.create(&name, config.as_ref(), kernel.cache().into())?
@@ -576,11 +600,33 @@ impl LiveNodeBuilder {
                 let client_id = client.client_id();
                 let venue = client.venue();
 
-                kernel
-                    .exec_engine
-                    .borrow_mut()
-                    .register_client(Box::new(client.clone()))?;
-                ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                if routing.default {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_default_client(Box::new(client.clone()));
+                    ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                } else if let Some(venues) = configured_venues(&routing) {
+                    let explicit_only = venues.is_empty();
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_client_with_routing(Box::new(client.clone()), Some(venues))?;
+                    if explicit_only {
+                        ExecutionEngine::subscribe_client_instruments(
+                            &kernel.exec_engine,
+                            client_id,
+                        );
+                    } else {
+                        ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                    }
+                } else {
+                    kernel
+                        .exec_engine
+                        .borrow_mut()
+                        .register_client(Box::new(client.clone()))?;
+                    ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+                }
                 exec_clients.push(client);
 
                 log::info!("Registered ExecutionClient-{client_id}");
@@ -635,6 +681,15 @@ impl LiveNodeBuilder {
 
         Ok(())
     }
+}
+
+fn configured_venues(routing: &RoutingConfig) -> Option<Vec<Venue>> {
+    routing.venues.as_ref().map(|venues| {
+        venues
+            .iter()
+            .map(|venue| Venue::from(venue.as_str()))
+            .collect()
+    })
 }
 
 impl ExternalMessageBusIngress {

@@ -58,6 +58,8 @@ pub struct StubExecutionClient {
     dispose_count: Rc<Cell<usize>>,
     submitted_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
+    canceled_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
+    queried_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     queried_account_ids: Rc<RefCell<Vec<AccountId>>>,
     handles_all_order_venues: bool,
     submit_order_error: Option<String>,
@@ -89,6 +91,8 @@ impl StubExecutionClient {
             dispose_count: Rc::new(Cell::new(0)),
             submitted_order_ids: Rc::new(RefCell::new(Vec::new())),
             modified_order_ids: Rc::new(RefCell::new(Vec::new())),
+            canceled_order_ids: Rc::new(RefCell::new(Vec::new())),
+            queried_order_ids: Rc::new(RefCell::new(Vec::new())),
             queried_account_ids: Rc::new(RefCell::new(Vec::new())),
             handles_all_order_venues: false,
             submit_order_error: None,
@@ -133,6 +137,18 @@ impl StubExecutionClient {
     #[must_use]
     pub fn modified_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
         self.modified_order_ids.clone()
+    }
+
+    /// Returns a shared handle to the canceled order IDs.
+    #[must_use]
+    pub fn canceled_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
+        self.canceled_order_ids.clone()
+    }
+
+    /// Returns a shared handle to the queried order IDs.
+    #[must_use]
+    pub fn queried_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
+        self.queried_order_ids.clone()
     }
 
     /// Returns a shared handle to the queried account IDs.
@@ -270,7 +286,10 @@ impl ExecutionClient for StubExecutionClient {
         Ok(()) // Stub implementation always succeeds
     }
 
-    fn cancel_order(&self, _cmd: CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        self.canceled_order_ids
+            .borrow_mut()
+            .push(cmd.client_order_id);
         Ok(()) // Stub implementation always succeeds
     }
 
@@ -288,7 +307,10 @@ impl ExecutionClient for StubExecutionClient {
         Ok(()) // Stub implementation always succeeds
     }
 
-    fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        self.queried_order_ids
+            .borrow_mut()
+            .push(cmd.client_order_id);
         Ok(()) // Stub implementation always succeeds
     }
 

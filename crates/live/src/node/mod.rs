@@ -645,13 +645,16 @@ impl LiveNode {
                     if !result.external_orders.is_empty() {
                         let exec_engine = self.kernel.exec_engine.borrow();
                         for external in result.external_orders {
-                            exec_engine.register_external_order(
+                            if let Err(e) = exec_engine.register_external_order_for_client(
+                                client_id,
                                 external.client_order_id,
                                 external.venue_order_id,
                                 external.instrument_id,
                                 external.strategy_id,
                                 external.ts_init,
-                            );
+                            ) {
+                                log::error!("Failed to register external order: {e}");
+                            }
                         }
                     }
                 }

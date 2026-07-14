@@ -152,6 +152,7 @@ pub struct DataEngine {
     clients: IndexMap<ClientId, DataClientAdapter>,
     default_client: Option<DataClientAdapter>,
     routing_map: IndexMap<Venue, ClientId>,
+    instrument_origins: AHashMap<InstrumentId, ClientId>,
     book_intervals: AHashMap<NonZeroUsize, BookSnapshotInfos>,
     book_snapshot_counts: IndexMap<BookSnapshotKey, usize>,
     book_deltas_counts: IndexMap<BookDeltasKey, usize>,
@@ -235,6 +236,7 @@ impl DataEngine {
             clients: IndexMap::new(),
             default_client: None,
             routing_map: IndexMap::new(),
+            instrument_origins: AHashMap::new(),
             book_intervals: AHashMap::new(),
             book_snapshot_counts: IndexMap::new(),
             book_deltas_counts: IndexMap::new(),
@@ -467,6 +469,66 @@ impl DataEngine {
         }
     }
 
+    /// Registers a data client without creating a venue fallback route.
+    ///
+    /// Commands and requests for this client must carry its explicit client ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client ID is already registered.
+    pub fn register_client_explicit_only(
+        &mut self,
+        client: DataClientAdapter,
+    ) -> anyhow::Result<()> {
+        let client_id = client.client_id();
+
+        if self.clients.contains_key(&client_id)
+            || self
+                .default_client
+                .as_ref()
+                .is_some_and(|default| default.client_id() == client_id)
+        {
+            anyhow::bail!("Client already registered with ID {client_id}");
+        }
+
+        self.clients.insert(client_id, client);
+        log::debug!("Registered explicit-only client {client_id}");
+        Ok(())
+    }
+
+    /// Registers an additional venue route for an existing data client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is unknown or the venue already routes to another client.
+    pub fn register_venue_routing(
+        &mut self,
+        client_id: ClientId,
+        venue: Venue,
+    ) -> anyhow::Result<()> {
+        if !self.clients.contains_key(&client_id) {
+            anyhow::bail!("No client registered with ID {client_id}");
+        }
+
+        if let Some(existing_client_id) = self.routing_map.get(&venue)
+            && *existing_client_id != client_id
+        {
+            anyhow::bail!(
+                "Venue {venue} already routed to {existing_client_id}, cannot re-route to {client_id}"
+            );
+        }
+
+        self.routing_map.insert(venue, client_id);
+        log::info!("Set data client {client_id} routing for {venue}");
+        Ok(())
+    }
+
+    /// Returns the recorded data-client origin for an instrument.
+    #[must_use]
+    pub fn instrument_origin(&self, instrument_id: &InstrumentId) -> Option<ClientId> {
+        self.instrument_origins.get(instrument_id).copied()
+    }
+
     /// Deregisters the client for the `client_id`.
     ///
     /// # Panics
@@ -476,6 +538,8 @@ impl DataEngine {
         check_key_in_map(client_id, &self.clients, "client_id", "clients").expect(FAILED);
 
         self.clients.shift_remove(client_id);
+        self.instrument_origins
+            .retain(|_, origin_client_id| origin_client_id != client_id);
         log::info!("Deregistered client {client_id}");
     }
 
@@ -1023,11 +1087,18 @@ impl DataEngine {
         #[cfg(feature = "streaming")]
         let cmd = self.subscribe_command_with_prefilled_start_ns(cmd)?;
 
+        if let (Some(client_id), Some(instrument_id)) =
+            (cmd.client_id().copied(), subscribe_instrument_id(&cmd))
+            && self.has_registered_client(client_id)
+        {
+            self.resolve_instrument_origin(instrument_id, Some(client_id))?;
+        }
+
         if let Some(client) = self.get_command_client(cmd.client_id(), cmd.venue()) {
             client.execute_subscribe(cmd);
         } else {
-            log::error!(
-                "Cannot handle command: no client found for client_id={:?}, venue={:?}",
+            anyhow::bail!(
+                "AMBIGUOUS_DATA_CLIENT: no client found for client_id={:?}, venue={:?}",
                 cmd.client_id(),
                 cmd.venue(),
             );
@@ -1227,6 +1298,12 @@ impl DataEngine {
         &mut self,
         req: RequestCommand,
     ) -> anyhow::Result<ClientId> {
+        if let (Some(client_id), Some(instrument_id)) =
+            (req.client_id().copied(), request_instrument_id(&req))
+            && self.has_registered_client(client_id)
+        {
+            self.resolve_instrument_origin(instrument_id, Some(client_id))?;
+        }
         let client_id = req.client_id().copied();
         let venue = req.venue().copied();
         let Some(client) = self.get_client(client_id.as_ref(), venue.as_ref()) else {
@@ -1649,7 +1726,9 @@ impl DataEngine {
         // and custom data are also `Data` enum variants handled in `process_data`, but can arrive
         // here as typed data, whereas `InstrumentAny` is not a `Data` variant.
         if let Some(instrument) = data.downcast_ref::<InstrumentAny>() {
-            self.handle_instrument(instrument);
+            if let Err(e) = self.handle_instrument(instrument, None) {
+                log::error!("{e}");
+            }
         } else if let Some(funding_rate) = data.downcast_ref::<FundingRateUpdate>() {
             self.handle_funding_rate(*funding_rate);
         } else if let Some(option_greeks) = data.downcast_ref::<OptionGreeks>() {
@@ -1827,10 +1906,10 @@ impl DataEngine {
 
         match &resp {
             DataResponse::Instrument(r) => {
-                self.handle_instrument_response(r.data.clone());
+                self.handle_instrument_response(&r.data, Some(r.client_id));
             }
             DataResponse::Instruments(r) => {
-                self.handle_instruments(&r.data);
+                self.handle_instruments(&r.data, Some(r.client_id));
             }
             DataResponse::Quotes(r) => {
                 if !log_if_empty_response(&r.data, &r.instrument_id, &correlation_id) {
@@ -2324,8 +2403,15 @@ impl DataEngine {
         !self.config.disable_historical_cache
     }
 
-    fn handle_instrument(&mut self, instrument: &InstrumentAny) {
+    fn handle_instrument(
+        &mut self,
+        instrument: &InstrumentAny,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
         log::debug!("Handling instrument: {}", instrument.id());
+
+        let instrument_id = instrument.id();
+        let origin = self.resolve_instrument_origin(instrument_id, client_id)?;
 
         if let Err(e) = self
             .cache
@@ -2336,11 +2422,78 @@ impl DataEngine {
             log_error_on_cache_insert(&e);
         }
 
-        let topic = switchboard::get_instrument_topic(instrument.id());
+        let topic = switchboard::get_instrument_topic(instrument_id);
         log::debug!("Publishing instrument to topic: {topic}");
         msgbus::publish_instrument(topic, instrument);
 
+        if let Some(origin) = origin {
+            let origin_topic = format!("data.instrument_origin.{origin}.{instrument_id}");
+            msgbus::publish_instrument(origin_topic.into(), instrument);
+        }
+
         self.update_option_chains(instrument);
+        Ok(())
+    }
+
+    fn resolve_instrument_origin(
+        &mut self,
+        instrument_id: InstrumentId,
+        requested_client_id: Option<ClientId>,
+    ) -> anyhow::Result<Option<ClientId>> {
+        let venue = instrument_id.venue;
+        if self.clients.is_empty() && self.default_client.is_none() {
+            return Ok(None);
+        }
+        let resolved = if let Some(client_id) = requested_client_id {
+            self.clients
+                .get(&client_id)
+                .or_else(|| {
+                    self.default_client
+                        .as_ref()
+                        .filter(|default| default.client_id() == client_id)
+                })
+                .ok_or_else(|| anyhow::anyhow!("Unknown instrument origin client {client_id}"))?;
+            client_id
+        } else if let Some(client_id) = self.instrument_origins.get(&instrument_id) {
+            *client_id
+        } else if let Some(client_id) = self.routing_map.get(&venue) {
+            *client_id
+        } else {
+            let mut candidates = self
+                .clients
+                .values()
+                .filter(|client| client.venue == Some(venue))
+                .map(|client| client.client_id());
+            let candidate = candidates.next();
+            if candidate.is_none() {
+                return Ok(None);
+            }
+            if candidates.next().is_some() {
+                anyhow::bail!(
+                    "AMBIGUOUS_INSTRUMENT_ORIGIN: instrument_id={instrument_id}, client_id required"
+                );
+            }
+            candidate.expect("candidate checked as present")
+        };
+
+        if let Some(existing) = self.instrument_origins.get(&instrument_id)
+            && *existing != resolved
+        {
+            anyhow::bail!(
+                "CLIENT_INSTRUMENT_ORIGIN_MISMATCH: client_id={resolved}, origin_client_id={existing}, instrument_id={instrument_id}"
+            );
+        }
+
+        self.instrument_origins.insert(instrument_id, resolved);
+        Ok(Some(resolved))
+    }
+
+    fn has_registered_client(&self, client_id: ClientId) -> bool {
+        self.clients.contains_key(&client_id)
+            || self
+                .default_client
+                .as_ref()
+                .is_some_and(|default| default.client_id() == client_id)
     }
 
     fn update_option_chains(&mut self, instrument: &InstrumentAny) {
@@ -3834,19 +3987,20 @@ impl DataEngine {
         self.book_snapshotters.insert(interval_ms, snapshotter);
     }
 
-    fn handle_instrument_response(&self, instrument: InstrumentAny) {
-        let mut cache = self.cache.as_ref().borrow_mut();
-        if let Err(e) = cache.add_instrument(instrument) {
-            log_error_on_cache_insert(&e);
+    fn handle_instrument_response(
+        &mut self,
+        instrument: &InstrumentAny,
+        client_id: Option<ClientId>,
+    ) {
+        if let Err(e) = self.handle_instrument(instrument, client_id) {
+            log::error!("{e}");
         }
     }
 
-    fn handle_instruments(&self, instruments: &[InstrumentAny]) {
-        // TODO: Improve by adding bulk update methods to cache and database
-        let mut cache = self.cache.as_ref().borrow_mut();
+    fn handle_instruments(&mut self, instruments: &[InstrumentAny], client_id: Option<ClientId>) {
         for instrument in instruments {
-            if let Err(e) = cache.add_instrument(instrument.clone()) {
-                log_error_on_cache_insert(&e);
+            if let Err(e) = self.handle_instrument(instrument, client_id) {
+                log::error!("{e}");
             }
         }
     }
@@ -5053,6 +5207,44 @@ fn spread_instrument_legs(instrument: &InstrumentAny) -> Option<Vec<(InstrumentI
         .split(GENERIC_SPREAD_ID_SEPARATOR)
         .map(|component| parse_spread_leg(component, instrument_id.venue))
         .collect()
+}
+
+fn subscribe_instrument_id(command: &SubscribeCommand) -> Option<InstrumentId> {
+    match command {
+        SubscribeCommand::Instrument(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::BookDeltas(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::BookDepth10(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::BookSnapshots(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::Quotes(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::Trades(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::Bars(cmd) => Some(cmd.bar_type.instrument_id()),
+        SubscribeCommand::MarkPrices(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::IndexPrices(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::FundingRates(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::InstrumentStatus(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::InstrumentClose(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::OptionGreeks(cmd) => Some(cmd.instrument_id),
+        SubscribeCommand::Data(_)
+        | SubscribeCommand::Instruments(_)
+        | SubscribeCommand::OptionChain(_) => None,
+    }
+}
+
+fn request_instrument_id(command: &RequestCommand) -> Option<InstrumentId> {
+    match command {
+        RequestCommand::Instrument(cmd) => Some(cmd.instrument_id),
+        RequestCommand::BookSnapshot(cmd) => Some(cmd.instrument_id),
+        RequestCommand::BookDeltas(cmd) => Some(cmd.instrument_id),
+        RequestCommand::BookDepth(cmd) => Some(cmd.instrument_id),
+        RequestCommand::Quotes(cmd) => Some(cmd.instrument_id),
+        RequestCommand::Trades(cmd) => Some(cmd.instrument_id),
+        RequestCommand::FundingRates(cmd) => Some(cmd.instrument_id),
+        RequestCommand::Bars(cmd) => Some(cmd.bar_type.instrument_id()),
+        RequestCommand::Data(_)
+        | RequestCommand::Instruments(_)
+        | RequestCommand::ForwardPrices(_)
+        | RequestCommand::Join(_) => None,
+    }
 }
 
 fn parse_spread_leg(component: &str, venue: Venue) -> Option<(InstrumentId, i64)> {

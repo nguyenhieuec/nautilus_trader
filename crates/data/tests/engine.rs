@@ -630,6 +630,112 @@ fn test_register_and_deregister_client(
 }
 
 #[rstest]
+fn register_two_data_clients_same_venue_explicit_only_succeeds(
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let venue = Venue::from("BINANCE");
+    let mut engine = data_engine.borrow_mut();
+
+    for client_id in [
+        ClientId::from("BINANCE_SPOT"),
+        ClientId::from("BINANCE_FUTURES"),
+    ] {
+        let client = MockDataClient::new(clock.clone(), cache.clone(), client_id, Some(venue));
+        let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client));
+        engine.register_client_explicit_only(adapter).unwrap();
+    }
+
+    assert_eq!(engine.registered_clients().len(), 2);
+    assert!(engine.get_client(None, Some(&venue)).is_none());
+}
+
+#[rstest]
+fn explicit_data_client_id_routes_each_same_venue_subscription(
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let venue = Venue::from("BINANCE");
+    let spot_id = ClientId::from("BINANCE_SPOT");
+    let futures_id = ClientId::from("BINANCE_FUTURES");
+    let spot_recorder = Rc::new(RefCell::new(Vec::new()));
+    let futures_recorder = Rc::new(RefCell::new(Vec::new()));
+    let mut engine = data_engine.borrow_mut();
+
+    for (client_id, recorder) in [
+        (spot_id, spot_recorder.clone()),
+        (futures_id, futures_recorder.clone()),
+    ] {
+        let client = MockDataClient::new_with_recorder(
+            clock.clone(),
+            cache.clone(),
+            client_id,
+            Some(venue),
+            Some(recorder),
+        );
+        let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client));
+        engine.register_client_explicit_only(adapter).unwrap();
+    }
+
+    for (instrument_id, client_id) in [
+        (InstrumentId::from("BTCUSDT.BINANCE"), spot_id),
+        (InstrumentId::from("BTCUSDT-PERP.BINANCE"), futures_id),
+    ] {
+        engine
+            .execute_subscribe(SubscribeCommand::Instrument(SubscribeInstrument::new(
+                instrument_id,
+                Some(client_id),
+                Some(venue),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            )))
+            .unwrap();
+    }
+
+    assert_eq!(spot_recorder.borrow().len(), 1);
+    assert_eq!(futures_recorder.borrow().len(), 1);
+}
+
+#[rstest]
+fn missing_data_client_id_with_ambiguous_venue_is_denied(
+    data_engine: Rc<RefCell<DataEngine>>,
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+) {
+    let venue = Venue::from("BINANCE");
+    let mut engine = data_engine.borrow_mut();
+    for client_id in [
+        ClientId::from("BINANCE_SPOT"),
+        ClientId::from("BINANCE_FUTURES"),
+    ] {
+        let client = MockDataClient::new(clock.clone(), cache.clone(), client_id, Some(venue));
+        let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client));
+        engine.register_client_explicit_only(adapter).unwrap();
+    }
+
+    let result = engine.execute_subscribe(SubscribeCommand::Instrument(SubscribeInstrument::new(
+        InstrumentId::from("BTCUSDT.BINANCE"),
+        None,
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("AMBIGUOUS_DATA_CLIENT")
+    );
+}
+
+#[rstest]
 fn test_register_default_client(
     data_engine: Rc<RefCell<DataEngine>>,
     clock: Rc<RefCell<TestClock>>,

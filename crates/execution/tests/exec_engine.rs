@@ -33,7 +33,7 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount,
+            BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount, QueryOrder,
             SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
@@ -13158,6 +13158,328 @@ fn test_register_client_errors_on_duplicate_venue(mut execution_engine: Executio
             .unwrap_err()
             .to_string()
             .contains("already routed to CLIENT_A"),
+    );
+}
+
+struct ExplicitClientCalls {
+    submitted: Rc<RefCell<Vec<ClientOrderId>>>,
+    modified: Rc<RefCell<Vec<ClientOrderId>>>,
+    canceled: Rc<RefCell<Vec<ClientOrderId>>>,
+    queried: Rc<RefCell<Vec<ClientOrderId>>>,
+}
+
+fn register_explicit_client(
+    engine: &mut ExecutionEngine,
+    client_id: ClientId,
+    venue: Venue,
+) -> ExplicitClientCalls {
+    let client = StubExecutionClient::new(
+        client_id,
+        AccountId::from(format!("{client_id}-ACCOUNT").as_str()),
+        venue,
+        OmsType::Netting,
+        None,
+    );
+    let calls = ExplicitClientCalls {
+        submitted: client.submitted_order_ids(),
+        modified: client.modified_order_ids(),
+        canceled: client.canceled_order_ids(),
+        queried: client.queried_order_ids(),
+    };
+    engine
+        .register_client_explicit_only(Box::new(client))
+        .unwrap();
+    calls
+}
+
+fn add_routing_test_order(
+    engine: &ExecutionEngine,
+    instrument: &CurrencyPair,
+    client_id: ClientId,
+    client_order_id: &str,
+) -> OrderAny {
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(TraderId::test_default())
+        .strategy_id(StrategyId::test_default())
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(10))
+        .build();
+    engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id), true)
+        .unwrap();
+    order
+}
+
+fn submit_command(order: &OrderAny, client_id: Option<ClientId>) -> SubmitOrder {
+    SubmitOrder {
+        trader_id: order.trader_id(),
+        strategy_id: order.strategy_id(),
+        instrument_id: order.instrument_id(),
+        client_order_id: order.client_order_id(),
+        order_init: order.init_event().clone(),
+        position_id: None,
+        params: None,
+        client_id,
+        exec_algorithm_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        correlation_id: None,
+        causation_id: None,
+    }
+}
+
+fn assert_cross_product_commands_rejected(
+    mut engine: ExecutionEngine,
+    origin_client_id: ClientId,
+    wrong_client_id: ClientId,
+) {
+    let instrument = audusd_sim();
+    let venue = instrument.id.venue;
+    let _origin_calls = register_explicit_client(&mut engine, origin_client_id, venue);
+    let wrong_calls = register_explicit_client(&mut engine, wrong_client_id, venue);
+    engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+    engine
+        .register_instrument_origin(instrument.id, origin_client_id)
+        .unwrap();
+
+    let submit = add_routing_test_order(&engine, &instrument, origin_client_id, "O-CROSS-SUBMIT");
+    engine.execute(TradingCommand::SubmitOrder(submit_command(
+        &submit,
+        Some(wrong_client_id),
+    )));
+
+    let modify = add_routing_test_order(&engine, &instrument, origin_client_id, "O-CROSS-MODIFY");
+    engine.execute(TradingCommand::ModifyOrder(ModifyOrder {
+        trader_id: modify.trader_id(),
+        client_id: Some(wrong_client_id),
+        strategy_id: modify.strategy_id(),
+        instrument_id: modify.instrument_id(),
+        client_order_id: modify.client_order_id(),
+        venue_order_id: None,
+        quantity: Some(Quantity::from(11)),
+        price: None,
+        trigger_price: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    }));
+
+    let cancel = add_routing_test_order(&engine, &instrument, origin_client_id, "O-CROSS-CANCEL");
+    engine.execute(TradingCommand::CancelOrder(CancelOrder {
+        trader_id: cancel.trader_id(),
+        client_id: Some(wrong_client_id),
+        strategy_id: cancel.strategy_id(),
+        instrument_id: cancel.instrument_id(),
+        client_order_id: cancel.client_order_id(),
+        venue_order_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    }));
+
+    let query = add_routing_test_order(&engine, &instrument, origin_client_id, "O-CROSS-QUERY");
+    engine.execute(TradingCommand::QueryOrder(QueryOrder::new(
+        query.trader_id(),
+        Some(wrong_client_id),
+        query.strategy_id(),
+        query.instrument_id(),
+        query.client_order_id(),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+
+    assert!(wrong_calls.submitted.borrow().is_empty());
+    assert!(wrong_calls.modified.borrow().is_empty());
+    assert!(wrong_calls.canceled.borrow().is_empty());
+    assert!(wrong_calls.queried.borrow().is_empty());
+}
+
+#[rstest]
+fn register_two_clients_same_venue_explicit_only_succeeds(mut execution_engine: ExecutionEngine) {
+    let venue = Venue::from("BINANCE");
+    register_explicit_client(&mut execution_engine, ClientId::from("BINANCE_SPOT"), venue);
+    register_explicit_client(
+        &mut execution_engine,
+        ClientId::from("BINANCE_FUTURES"),
+        venue,
+    );
+    assert_eq!(execution_engine.client_ids().len(), 2);
+}
+
+#[rstest]
+fn explicit_client_id_routes_each_same_venue_client(mut execution_engine: ExecutionEngine) {
+    let spot = audusd_sim();
+    let futures = gbpusd_sim();
+    let venue = spot.id.venue;
+    let spot_id = ClientId::from("BINANCE_SPOT");
+    let futures_id = ClientId::from("BINANCE_FUTURES");
+    let spot_calls = register_explicit_client(&mut execution_engine, spot_id, venue);
+    let futures_calls = register_explicit_client(&mut execution_engine, futures_id, venue);
+    {
+        let mut cache = execution_engine.cache().borrow_mut();
+        cache.add_instrument(spot.clone().into()).unwrap();
+        cache.add_instrument(futures.clone().into()).unwrap();
+    }
+    execution_engine
+        .register_instrument_origin(spot.id, spot_id)
+        .unwrap();
+    execution_engine
+        .register_instrument_origin(futures.id, futures_id)
+        .unwrap();
+
+    let spot_order = add_routing_test_order(&execution_engine, &spot, spot_id, "O-SPOT");
+    let futures_order =
+        add_routing_test_order(&execution_engine, &futures, futures_id, "O-FUTURES");
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_command(
+        &spot_order,
+        Some(spot_id),
+    )));
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_command(
+        &futures_order,
+        Some(futures_id),
+    )));
+
+    assert_eq!(
+        spot_calls.submitted.borrow().as_slice(),
+        &[spot_order.client_order_id()]
+    );
+    assert_eq!(
+        futures_calls.submitted.borrow().as_slice(),
+        &[futures_order.client_order_id()]
+    );
+}
+
+#[rstest]
+fn missing_client_id_with_ambiguous_venue_is_denied(mut execution_engine: ExecutionEngine) {
+    let instrument = audusd_sim();
+    let origin_id = ClientId::from("BINANCE_SPOT");
+    register_explicit_client(&mut execution_engine, origin_id, instrument.id.venue);
+    register_explicit_client(
+        &mut execution_engine,
+        ClientId::from("BINANCE_FUTURES"),
+        instrument.id.venue,
+    );
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+    execution_engine
+        .register_instrument_origin(instrument.id, origin_id)
+        .unwrap();
+    let order = add_routing_test_order(&execution_engine, &instrument, origin_id, "O-AMBIGUOUS");
+
+    execution_engine.execute(TradingCommand::SubmitOrder(submit_command(&order, None)));
+
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Denied
+    );
+}
+
+#[rstest]
+fn mass_status_queries_all_explicit_only_clients(mut execution_engine: ExecutionEngine) {
+    let venue = Venue::from("BINANCE");
+    let expected = vec![
+        ClientId::from("BINANCE_SPOT"),
+        ClientId::from("BINANCE_FUTURES"),
+    ];
+    for client_id in &expected {
+        register_explicit_client(&mut execution_engine, *client_id, venue);
+    }
+    assert_eq!(execution_engine.client_ids(), expected);
+}
+
+#[rstest]
+fn cancel_and_query_use_the_cached_originating_client(mut execution_engine: ExecutionEngine) {
+    let instrument = audusd_sim();
+    let client_id = ClientId::from("BINANCE_SPOT");
+    let calls = register_explicit_client(&mut execution_engine, client_id, instrument.id.venue);
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+    execution_engine
+        .register_instrument_origin(instrument.id, client_id)
+        .unwrap();
+    let order = add_routing_test_order(&execution_engine, &instrument, client_id, "O-ORIGIN");
+
+    execution_engine.execute(TradingCommand::CancelOrder(CancelOrder {
+        trader_id: order.trader_id(),
+        client_id: Some(client_id),
+        strategy_id: order.strategy_id(),
+        instrument_id: order.instrument_id(),
+        client_order_id: order.client_order_id(),
+        venue_order_id: None,
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    }));
+    execution_engine.execute(TradingCommand::QueryOrder(QueryOrder::new(
+        order.trader_id(),
+        Some(client_id),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+    )));
+
+    assert_eq!(
+        calls.canceled.borrow().as_slice(),
+        &[order.client_order_id()]
+    );
+    assert_eq!(
+        calls.queried.borrow().as_slice(),
+        &[order.client_order_id()]
+    );
+}
+
+#[rstest]
+fn spot_instrument_rejects_futures_client_for_submit_modify_cancel_query(
+    execution_engine: ExecutionEngine,
+) {
+    assert_cross_product_commands_rejected(
+        execution_engine,
+        ClientId::from("BINANCE_SPOT"),
+        ClientId::from("BINANCE_FUTURES"),
+    );
+}
+
+#[rstest]
+fn futures_instrument_rejects_spot_client_for_submit_modify_cancel_query(
+    execution_engine: ExecutionEngine,
+) {
+    assert_cross_product_commands_rejected(
+        execution_engine,
+        ClientId::from("BINANCE_FUTURES"),
+        ClientId::from("BINANCE_SPOT"),
     );
 }
 
