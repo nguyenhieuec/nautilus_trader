@@ -17,7 +17,7 @@
 
 #[cfg(feature = "defi")]
 use std::sync::Arc;
-use std::{borrow::Cow, cell::RefCell, rc::Rc};
+use std::{borrow::Cow, cell::RefCell, rc::Rc, time::Duration};
 
 use ahash::{AHashMap, AHashSet};
 use bytes::Bytes;
@@ -75,10 +75,22 @@ use crate::{
         OrderBookLookupError, OrderListLookupError, OrderLookupError, OrderRef,
         OwnOrderBookLookupError, POSITION_NOT_FOUND, PositionLookupError,
         SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError,
-        database::{CacheDatabaseAdapter, CacheMap},
+        database::{CacheDatabaseAdapter, CacheMap, PersistenceError},
     },
     signal::Signal,
 };
+
+#[test]
+fn fence_without_database_returns_typed_missing_backing_error() {
+    let cache = Cache::default();
+
+    assert_eq!(
+        cache
+            .fence_database_current(Duration::from_millis(1))
+            .unwrap_err(),
+        PersistenceError::MissingBacking
+    );
+}
 
 fn build_order_canceled(
     trader_id: TraderId,

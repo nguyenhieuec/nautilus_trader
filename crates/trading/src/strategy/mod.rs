@@ -18,7 +18,10 @@ pub mod config;
 pub mod core;
 
 pub use core::{StrategyCore, StrategyNative};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    time::Duration,
+};
 
 use ahash::AHashSet;
 pub use api::{OrderApi, PortfolioApi};
@@ -27,6 +30,7 @@ use nautilus_common::{
     actor::DataActor,
     component::Component,
     enums::ComponentState,
+    execution_persistence::{ExecutionWriteIdentity, ExecutionWriteKind, StagedExecutionWrite},
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
@@ -149,11 +153,53 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.submit_order_with_stage(order, position_id, client_id, params, None)
+    }
+
+    /// Submits an order only after activating its exact staged authorization with a durable fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence, activation, or command publication preparation fails.
+    fn submit_order_staged(
+        &mut self,
+        order: OrderAny,
+        position_id: Option<PositionId>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        stage: StagedExecutionWrite,
+        command_id: UUID4,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        self.submit_order_with_stage(
+            order,
+            position_id,
+            client_id,
+            params,
+            Some((stage, command_id)),
+        )
+    }
+
+    #[doc(hidden)]
+    fn submit_order_with_stage(
+        &mut self,
+        order: OrderAny,
+        position_id: Option<PositionId>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        staged: Option<(StagedExecutionWrite, UUID4)>,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
         let core = StrategyNative::strategy_core_mut(self);
 
         let trader_id = registered_trader_id(core)?;
         let strategy_id = StrategyId::from(core.actor_id().inner().as_str());
         let ts_init = core.clock_mut().timestamp_ns();
+        let command_id = staged.map_or_else(UUID4::new, |(_, command_id)| command_id);
 
         if order.status() != OrderStatus::Initialized {
             anyhow::bail!(
@@ -177,7 +223,7 @@ pub trait Strategy: DataActor {
         let core = StrategyNative::strategy_core_mut(self);
         let params = params.filter(|params| !params.is_empty());
 
-        {
+        let persistence = {
             let cache_rc = core.cache_rc();
             let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
                 anyhow::anyhow!(
@@ -186,6 +232,38 @@ pub trait Strategy: DataActor {
                 )
             })?;
             cache.add_order(order.clone(), position_id, client_id, true)?;
+            if cache.has_backing() || staged.is_some() {
+                match cache.fence_database_current(Duration::from_secs(1)) {
+                    Ok(receipt) => Some(receipt),
+                    Err(error) => {
+                        if let Some(activator) = &core.persisted_write_activator {
+                            activator.halt(&error);
+                        }
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((stage, _)) = staged {
+            let activator = core.persisted_write_activator.as_ref().ok_or({
+                nautilus_common::execution_persistence::ExecutionWriteActivationError::MissingActivator
+            })?;
+            let receipt = persistence
+                .ok_or(nautilus_common::cache::database::PersistenceError::MissingBacking)?;
+            let identity = ExecutionWriteIdentity {
+                command_id,
+                client_order_id: Some(order.client_order_id()),
+                instrument_id: order.instrument_id(),
+                kind: ExecutionWriteKind::Submit,
+                expires_at: stage.expires_at,
+            };
+            if let Err(error) = activator.activate_persisted(stage.token, identity, receipt) {
+                activator.halt_activation(&error);
+                return Err(error.into());
+            }
         }
 
         publish_order_initialized(&order);
@@ -200,7 +278,7 @@ pub trait Strategy: DataActor {
             order.exec_algorithm_id(),
             position_id,
             params,
-            UUID4::new(),
+            command_id,
             ts_init,
             None, // correlation_id
         );

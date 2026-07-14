@@ -21,7 +21,7 @@ pub mod query;
 pub mod report;
 pub mod submit;
 
-use nautilus_core::{Params, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     identifiers::{ClientId, InstrumentId, StrategyId},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -67,6 +67,22 @@ pub enum TradingCommand {
 }
 
 impl TradingCommand {
+    /// Returns the command's stable identifier.
+    #[must_use]
+    pub const fn command_id(&self) -> UUID4 {
+        match self {
+            Self::SubmitOrder(command) => command.command_id,
+            Self::SubmitOrderList(command) => command.command_id,
+            Self::ModifyOrder(command) => command.command_id,
+            Self::ModifyOrders(command) => command.command_id,
+            Self::CancelOrder(command) => command.command_id,
+            Self::CancelOrders(command) => command.command_id,
+            Self::CancelAllOrders(command) => command.command_id,
+            Self::QueryOrder(command) => command.command_id,
+            Self::QueryAccount(command) => command.command_id,
+        }
+    }
+
     #[must_use]
     pub const fn client_id(&self) -> Option<ClientId> {
         match self {

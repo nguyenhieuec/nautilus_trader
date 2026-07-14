@@ -15,7 +15,7 @@
 
 //! Provides a `Cache` database backing.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -54,6 +54,82 @@ pub struct CacheMap {
     pub yield_curves: AHashMap<String, YieldCurveData>,
 }
 
+/// Monotonic sequence assigned to one queued cache mutation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PersistenceSequence(u64);
+
+impl PersistenceSequence {
+    /// Creates a persistence sequence from its raw monotonic value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw monotonic value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Disk acknowledgement for all cache mutations through one sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersistenceReceipt {
+    /// Highest mutation sequence included in the fence.
+    pub through: PersistenceSequence,
+    /// Number of local AOFs Redis reported fsynced.
+    pub local_aofs_fsynced: u32,
+    /// Number of replica AOFs Redis reported fsynced.
+    pub replica_aofs_fsynced: u32,
+    /// Completion timestamp recorded after the AOF acknowledgement.
+    pub completed_at: UnixNanos,
+}
+
+/// Failure while draining or disk-acknowledging cache mutations.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PersistenceError {
+    /// The cache has no durable backing adapter.
+    #[error("cache has no durable database backing")]
+    MissingBacking,
+    /// The backing adapter does not implement a durable fence.
+    #[error("cache database does not support durable persistence fences")]
+    Unsupported,
+    /// A command could not be delivered to or acknowledged by the worker.
+    #[error("cache persistence reply channel failed: {0}")]
+    ReplyChannel(String),
+    /// A queued mutation failed before the fence could be issued.
+    #[error("cache mutation failed through sequence {through:?}: {detail}")]
+    Mutation {
+        /// Highest sequence known when the mutation failed.
+        through: PersistenceSequence,
+        /// Transport or serialization failure detail.
+        detail: String,
+    },
+    /// The AOF fence timed out.
+    #[error("cache persistence fence timed out after {0:?}")]
+    Timeout(Duration),
+    /// Redis reported no local AOF fsync.
+    #[error("cache persistence fence reported zero local AOF fsyncs")]
+    LocalAofNotFsynced,
+    /// Redis reported no replica AOF fsync.
+    #[error("cache persistence fence reported zero replica AOF fsyncs")]
+    ReplicaAofNotFsynced,
+    /// Redis returned a malformed WAITAOF reply.
+    #[error("invalid WAITAOF reply: {0}")]
+    InvalidReply(String),
+}
+
+/// Typed failure while restoring the live execution cache before startup.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CacheLoadError {
+    /// The live node has no durable cache adapter.
+    #[error("live cache loading requires a durable database backing")]
+    MissingBacking,
+    /// Rebuilt cache indices failed the integrity check.
+    #[error("loaded cache failed post-build integrity validation")]
+    Integrity,
+}
+
 /// Factory for constructing cache database adapters at runtime.
 ///
 /// Implementations own the concrete database configuration and return the transport-neutral
@@ -88,6 +164,16 @@ pub trait CacheDatabaseAdapter {
     ///
     /// Returns an error if flushing changes fails.
     fn flush(&mut self) -> anyhow::Result<()>;
+
+    /// Drains every preceding mutation and waits for primary plus replica AOF acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every mutation through the returned sequence was executed and
+    /// Redis reported at least one local and one replica AOF fsync before `timeout`.
+    fn fence_current(&self, _timeout: Duration) -> Result<PersistenceReceipt, PersistenceError> {
+        Err(PersistenceError::Unsupported)
+    }
 
     /// Loads all cached data into memory.
     ///

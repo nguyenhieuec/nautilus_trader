@@ -61,11 +61,6 @@ impl RedisCacheDatabase {
         self.close();
     }
 
-    #[pyo3(name = "flushdb")]
-    fn py_flushdb(&mut self) {
-        get_runtime().block_on(async { self.flushdb().await });
-    }
-
     /// Retrieves all keys matching the given `pattern` from Redis for this trader.
     ///
     /// # Errors

@@ -36,14 +36,16 @@ use std::{
     fmt::{Debug, Display},
     rc::Rc,
     str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use ahash::{AHashMap, AHashSet};
 use bounded::BoundedVecDeque;
 use bytes::Bytes;
 pub use config::CacheConfig; // Re-export
-use database::{CacheDatabaseAdapter, CacheMap};
+use database::{
+    CacheDatabaseAdapter, CacheMap, PersistenceError, PersistenceReceipt, PersistenceSequence,
+};
 pub use error::{
     ACCOUNT_NOT_FOUND, AccountLookupError, CURRENCY_NOT_FOUND, CurrencyLookupError,
     INSTRUMENT_NOT_FOUND, InstrumentLookupError, ORDER_BOOK_NOT_FOUND, ORDER_LIST_NOT_FOUND,
@@ -2116,6 +2118,7 @@ pub struct Cache {
     config: CacheConfig,
     index: CacheIndex,
     database: Option<Box<dyn CacheDatabaseAdapter>>,
+    persistence_failure: Option<PersistenceError>,
     general: AHashMap<String, Bytes>,
     currencies: AHashMap<Ustr, Currency>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
@@ -2201,6 +2204,7 @@ impl Cache {
             config,
             index: CacheIndex::default(),
             database,
+            persistence_failure: None,
             general: AHashMap::new(),
             currencies: AHashMap::new(),
             instruments: AHashMap::new(),
@@ -2241,6 +2245,7 @@ impl Cache {
         let type_name = std::any::type_name_of_val(&*database);
         log::info!("Cache database adapter set: {type_name}");
         self.database = Some(database);
+        self.persistence_failure = None;
     }
 
     // -- COMMANDS --------------------------------------------------------------------------------
@@ -2614,6 +2619,36 @@ impl Cache {
     #[must_use]
     pub const fn has_backing(&self) -> bool {
         self.database.is_some()
+    }
+
+    /// Drains all queued database mutations and waits for durable primary and replica AOFs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no backing database is installed or the adapter cannot prove that
+    /// every preceding mutation reached both the local and replica AOFs before `timeout`.
+    pub fn fence_database_current(
+        &self,
+        timeout: Duration,
+    ) -> Result<PersistenceReceipt, PersistenceError> {
+        if let Some(error) = &self.persistence_failure {
+            return Err(error.clone());
+        }
+        self.database
+            .as_ref()
+            .ok_or(PersistenceError::MissingBacking)?
+            .fence_current(timeout)
+    }
+
+    fn record_persistence_failure(&mut self, error: &anyhow::Error) {
+        let failure = error
+            .downcast_ref::<PersistenceError>()
+            .cloned()
+            .unwrap_or_else(|| PersistenceError::Mutation {
+                through: PersistenceSequence::default(),
+                detail: error.to_string(),
+            });
+        self.persistence_failure.get_or_insert(failure);
     }
 
     // Calculate the unrealized profit and loss (PnL) for `position`.
@@ -4184,14 +4219,12 @@ impl Cache {
             log::debug!("Indexed {client_id:?}");
         }
 
-        if let Some(database) = &mut self.database {
-            database.add_order(&order, client_id)?;
-            // TODO: Implement
-            // if self.config.snapshot_orders {
-            //     database.snapshot_order_state(order)?;
-            // }
+        if let Some(database) = &mut self.database
+            && let Err(error) = database.add_order(&order, client_id)
+        {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
-
         match self.orders.get(&client_order_id) {
             // Reuse the existing cell on replace so the canonical entry stays in place
             // rather than orphaning a stale cell.
@@ -4240,8 +4273,11 @@ impl Cache {
             .insert(*client_order_id, *position_id);
 
         // Index: ClientOrderId -> PositionId
-        if let Some(database) = &mut self.database {
-            database.index_order_position(*client_order_id, *position_id)?;
+        if let Some(database) = &mut self.database
+            && let Err(error) = database.index_order_position(*client_order_id, *position_id)
+        {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
 
         // Index: PositionId -> StrategyId
@@ -4370,18 +4406,12 @@ impl Cache {
             .or_default()
             .insert(position.id);
 
-        if let Some(database) = &mut self.database {
-            database.add_position(position)?;
-            // TODO: Implement position snapshots
-            // if self.snapshot_positions {
-            //     database.snapshot_position_state(
-            //         position,
-            //         position.ts_last,
-            //         self.calculate_unrealized_pnl(&position),
-            //     )?;
-            // }
+        if let Some(database) = &mut self.database
+            && let Err(error) = database.add_position(position)
+        {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
-
         Ok(())
     }
 
@@ -4403,8 +4433,11 @@ impl Cache {
             }
         }
 
-        if let Some(database) = &mut self.database {
-            database.update_account(account)?;
+        if let Some(database) = &mut self.database
+            && let Err(error) = database.update_account(account)
+        {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
         Ok(())
     }
@@ -4457,11 +4490,17 @@ impl Cache {
         let account_id = account.id();
         self.cache_account_owned(account);
 
-        if let Some(database) = &mut self.database {
+        let persistence = if let Some(database) = &mut self.database {
             let Some(account_cell) = self.accounts.get(&account_id) else {
                 anyhow::bail!("Account {account_id} not found after cache update");
             };
-            database.update_account(&account_cell.borrow())?;
+            database.update_account(&account_cell.borrow())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = persistence {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
         Ok(())
     }
@@ -4482,8 +4521,14 @@ impl Cache {
 
         cell.borrow_mut().apply(event.clone())?;
 
-        if let Some(database) = &mut self.database {
-            database.update_account(&cell.borrow())?;
+        let persistence = if let Some(database) = &mut self.database {
+            database.update_account(&cell.borrow())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = persistence {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
         Ok(())
     }
@@ -4545,8 +4590,9 @@ impl Cache {
         snapshot.apply(event.clone())?;
         *order_cell.borrow_mut() = snapshot.clone();
 
-        if let Err(e) = self.refresh_order(&snapshot) {
-            log::error!("Error updating order in cache: {e}");
+        if let Err(error) = self.refresh_order(&snapshot) {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
 
         Ok(snapshot)
@@ -4656,14 +4702,12 @@ impl Cache {
             self.index.positions_open.remove(&position.id);
         }
 
-        if let Some(database) = &mut self.database {
-            database.update_position(position)?;
-            // TODO: Implement order snapshots
-            // if self.snapshot_orders {
-            //     database.snapshot_order_state(order)?;
-            // }
+        if let Some(database) = &mut self.database
+            && let Err(error) = database.update_position(position)
+        {
+            self.record_persistence_failure(&error);
+            return Err(error);
         }
-
         match self.positions.get(&position.id) {
             Some(position_cell) => *position_cell.borrow_mut() = position.clone(),
             None => {

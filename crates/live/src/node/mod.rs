@@ -82,7 +82,7 @@ use std::{error::Error, fmt::Debug, future::Future, pin::Pin, time::Duration};
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     actor::{Actor, DataActor, DataActorNative},
-    cache::database::CacheDatabaseAdapter,
+    cache::database::{CacheDatabaseAdapter, CacheLoadError},
     clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
@@ -434,6 +434,7 @@ impl LiveNode {
         self.handle.set_state(NodeState::Starting);
 
         self.kernel.reset_shutdown_flag();
+        self.load_cache_before_start().await?;
         self.kernel.start_async().await;
 
         if self.kernel.is_event_store_replay() {
@@ -867,6 +868,7 @@ impl LiveNode {
 
         self.handle.set_state(NodeState::Starting);
         self.kernel.reset_shutdown_flag();
+        self.load_cache_before_start().await?;
         self.kernel.start_async().await;
 
         if self.kernel.is_event_store_replay() {
@@ -1510,6 +1512,36 @@ impl LiveNode {
         Ok(self.await_engines_connected().await)
     }
 
+    #[expect(clippy::await_holding_refcell_ref)]
+    async fn load_cache_before_start(&self) -> anyhow::Result<()> {
+        if self
+            .config
+            .cache
+            .as_ref()
+            .is_some_and(|config| config.flush_on_start)
+        {
+            anyhow::bail!("flush_on_start=true is forbidden for a live node");
+        }
+
+        let venue_capable = !self.exec_clients.is_empty();
+
+        if !self.config.exec_engine.load_cache {
+            if self.config.environment == Environment::Live && venue_capable {
+                anyhow::bail!("load_cache=false is allowed only in non-production tests");
+            }
+            return Ok(());
+        }
+
+        if !self.kernel.cache().borrow().has_backing() {
+            if venue_capable {
+                return Err(CacheLoadError::MissingBacking.into());
+            }
+            return Ok(());
+        }
+
+        self.kernel.exec_engine.borrow_mut().load_cache().await
+    }
+
     fn startup_abort_reason(&self) -> Option<&'static str> {
         if self.handle.should_stop() {
             Some("Stop signal received during startup")
@@ -1672,6 +1704,16 @@ impl LiveNode {
             );
         }
 
+        let exec_engine = self.kernel.exec_engine.borrow();
+        if !exec_engine.client_ids().is_empty()
+            && exec_engine.persisted_execution_write_activator().is_none()
+        {
+            anyhow::bail!(
+                "a durable venue-capable node requires a persisted execution write activator"
+            );
+        }
+        drop(exec_engine);
+
         self.kernel.cache().borrow_mut().set_database(database);
         Ok(())
     }
@@ -1760,6 +1802,14 @@ impl LiveNode {
                 "Cannot add strategy while node is running, add strategies before calling start()"
             );
         }
+
+        let persisted_write_activator = self
+            .kernel
+            .exec_engine
+            .borrow()
+            .persisted_execution_write_activator();
+        StrategyNative::strategy_core_mut(&mut strategy)
+            .set_persisted_execution_write_activator(persisted_write_activator);
 
         // Capture strategy-owned values before adding the strategy, which moves it
         let strategy_id = self

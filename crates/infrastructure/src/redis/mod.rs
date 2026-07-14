@@ -24,14 +24,12 @@ use std::{fmt::Write as _, time::Duration};
 use nautilus_common::{logging::log_task_awaiting, msgbus::MessageBusConfig};
 use nautilus_core::{UUID4, string::semver::SemVer};
 use nautilus_model::identifiers::TraderId;
-use redis::RedisError;
 
 const REDIS_MIN_VERSION: &str = "6.2.0";
 const REDIS_DELIMITER: char = ':';
 const REDIS_INDEX_PATTERN: &str = ":index:";
 const REDIS_XTRIM: &str = "XTRIM";
 const REDIS_MINID: &str = "MINID";
-const REDIS_FLUSHDB: &str = "FLUSHDB";
 
 /// Extracts the index key from a full Redis key.
 ///
@@ -203,17 +201,6 @@ pub async fn create_redis_connection(
     }
 
     Ok(con)
-}
-
-/// Flushes the entire Redis database for the specified connection.
-///
-/// # Errors
-///
-/// Returns an error if the FLUSHDB command fails.
-pub async fn flush_redis(
-    con: &mut redis::aio::ConnectionManager,
-) -> anyhow::Result<(), RedisError> {
-    redis::cmd(REDIS_FLUSHDB).exec_async(con).await
 }
 
 /// Parse the stream key from the given identifiers and config.

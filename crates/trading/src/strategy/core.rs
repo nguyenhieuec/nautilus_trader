@@ -24,6 +24,7 @@ use nautilus_common::{
     actor::{DataActorConfig, DataActorCore, DataActorNative},
     cache::Cache,
     clock::Clock,
+    execution_persistence::PersistedExecutionWriteActivatorHandle,
     factories::OrderFactory,
 };
 use nautilus_execution::order_manager::manager::OrderManager;
@@ -62,6 +63,7 @@ pub struct StrategyCore {
     pub(crate) market_exit_attempts: u64,
     pub(crate) market_exit_timer_name: Ustr,
     pub(crate) market_exit_tag: Ustr,
+    pub(crate) persisted_write_activator: Option<PersistedExecutionWriteActivatorHandle>,
 }
 
 impl Debug for StrategyCore {
@@ -175,6 +177,7 @@ impl StrategyCore {
             market_exit_attempts: 0,
             market_exit_timer_name,
             market_exit_tag: Ustr::from("MARKET_EXIT"),
+            persisted_write_activator: None,
         }
     }
 
@@ -311,6 +314,14 @@ impl StrategyCore {
 
     pub(crate) fn cache_rc(&self) -> Rc<RefCell<Cache>> {
         DataActorNative::cache_rc(self)
+    }
+
+    /// Installs the application-owned persisted-write activator before strategy registration.
+    pub fn set_persisted_execution_write_activator(
+        &mut self,
+        activator: Option<PersistedExecutionWriteActivatorHandle>,
+    ) {
+        self.persisted_write_activator = activator;
     }
 
     /// Resets the market exit state.

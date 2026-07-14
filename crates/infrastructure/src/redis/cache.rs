@@ -23,13 +23,13 @@
 //! - **WRITE**: owned by a background task on `get_runtime()`, receives
 //!   commands via an unbounded `tokio::sync::mpsc` channel.
 //!
-//! All write operations (`insert`, `update`, `delete`, `flush`) are routed
+//! All non-destructive write operations (`insert`, `update`, `delete`) are routed
 //! through the command channel so they execute on the WRITE connection. This
 //! avoids cross-runtime I/O issues since the WRITE connection is always
 //! created on the Nautilus runtime.
 //!
-//! Synchronous callers (`close`, `flushdb_sync`) use `std::sync::mpsc` reply
-//! channels to block until the background task confirms completion. When
+//! Synchronous callers (`close`, persistence fences) use `std::sync::mpsc`
+//! reply channels to block until the background task confirms completion. When
 //! called from the Nautilus runtime itself, `block_in_place` is used
 //! automatically to avoid stalling the worker thread.
 
@@ -38,7 +38,11 @@ use std::{
     fmt::{Debug, Write as _},
     ops::ControlFlow,
     pin::Pin,
-    sync::mpsc::{self, SyncSender},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
     time::Duration,
 };
 
@@ -49,7 +53,10 @@ use chrono::{DateTime, Utc};
 use nautilus_common::{
     cache::{
         CacheConfig,
-        database::{CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap},
+        database::{
+            CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, PersistenceError,
+            PersistenceReceipt, PersistenceSequence,
+        },
     },
     enums::SerializationEncoding,
     live::get_runtime,
@@ -76,11 +83,14 @@ use nautilus_model::{
     position::Position,
     types::{Currency, Money},
 };
-use redis::{AsyncCommands, Pipeline, aio::ConnectionManager};
+use redis::{
+    AsyncCommands, AsyncConnectionConfig, Pipeline,
+    aio::{ConnectionManager, MultiplexedConnection},
+};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{REDIS_DELIMITER, REDIS_FLUSHDB, get_index_key};
+use super::{REDIS_DELIMITER, get_index_key, get_redis_url};
 use crate::redis::{RedisConnectionConfig, create_redis_connection, queries::DatabaseQueries};
 
 // Task and connection names
@@ -251,13 +261,19 @@ pub enum DatabaseOperation {
     UpdateOrder,
     ReplaceList,
     Delete,
-    Flush(SyncSender<()>),
+    Fence {
+        requested_through: PersistenceSequence,
+        timeout: Duration,
+        reply: SyncSender<Result<PersistenceReceipt, PersistenceError>>,
+    },
     Close,
 }
 
 /// Represents a database command to be performed which may be executed in a task.
 #[derive(Clone, Debug)]
 pub struct DatabaseCommand {
+    /// Monotonic sequence for one mutation, or the requested fence boundary.
+    pub sequence: PersistenceSequence,
     /// The database operation type.
     pub op_type: DatabaseOperation,
     /// The primary key for the operation.
@@ -269,8 +285,14 @@ pub struct DatabaseCommand {
 impl DatabaseCommand {
     /// Creates a new [`DatabaseCommand`] instance.
     #[must_use]
-    pub const fn new(op_type: DatabaseOperation, key: String, payload: Option<Vec<Bytes>>) -> Self {
+    pub const fn new(
+        sequence: PersistenceSequence,
+        op_type: DatabaseOperation,
+        key: String,
+        payload: Option<Vec<Bytes>>,
+    ) -> Self {
         Self {
+            sequence,
             op_type,
             key: Some(key),
             payload,
@@ -281,6 +303,7 @@ impl DatabaseCommand {
     #[must_use]
     pub const fn close() -> Self {
         Self {
+            sequence: PersistenceSequence::new(0),
             op_type: DatabaseOperation::Close,
             key: None,
             payload: None,
@@ -299,6 +322,8 @@ pub struct RedisCacheDatabase {
     pub encoding: SerializationEncoding,
     pub bulk_read_batch_size: Option<usize>,
     tx: tokio::sync::mpsc::UnboundedSender<DatabaseCommand>,
+    next_sequence: Arc<AtomicU64>,
+    enqueue_lock: Mutex<()>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -328,21 +353,35 @@ impl RedisCacheDatabase {
     ) -> anyhow::Result<Self> {
         install_cryptographic_provider();
 
+        if config.flush_on_start {
+            anyhow::bail!("flush_on_start=true is forbidden for the Redis cache adapter");
+        }
+
         let con = create_redis_connection(CACHE_READ, &database).await?;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseCommand>();
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
         let trader_key = get_trader_key(trader_id, instance_id, &config);
         let trader_key_clone = trader_key.clone();
         let encoding = config.encoding;
         let bulk_read_batch_size = config.bulk_read_batch_size;
 
         let handle = get_runtime().spawn(async move {
-            if let Err(e) =
-                process_commands(rx, trader_key_clone, config.clone(), database.clone()).await
+            if let Err(e) = process_commands(
+                rx,
+                trader_key_clone,
+                config.clone(),
+                database.clone(),
+                startup_tx,
+            )
+            .await
             {
                 log::error!("Error in task '{CACHE_PROCESS}': {e}");
             }
         });
+        startup_rx.await.map_err(|error| {
+            anyhow::anyhow!("cache write worker startup channel failed: {error}")
+        })??;
 
         Ok(Self {
             con,
@@ -351,6 +390,8 @@ impl RedisCacheDatabase {
             encoding,
             bulk_read_batch_size,
             tx,
+            next_sequence: Arc::new(AtomicU64::new(0)),
+            enqueue_lock: Mutex::new(()),
             handle: Some(handle),
         })
     }
@@ -363,6 +404,41 @@ impl RedisCacheDatabase {
     #[must_use]
     pub fn get_trader_key(&self) -> &str {
         &self.trader_key
+    }
+
+    fn next_command(
+        &self,
+        operation: DatabaseOperation,
+        key: String,
+        payload: Option<Vec<Bytes>>,
+    ) -> anyhow::Result<DatabaseCommand> {
+        let raw_sequence = self
+            .next_sequence
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("cache persistence sequence overflow"))?;
+        Ok(DatabaseCommand::new(
+            PersistenceSequence::new(raw_sequence),
+            operation,
+            key,
+            payload,
+        ))
+    }
+
+    fn send_mutation(
+        &self,
+        operation: DatabaseOperation,
+        key: String,
+        payload: Option<Vec<Bytes>>,
+    ) -> anyhow::Result<()> {
+        let _enqueue_guard = self
+            .enqueue_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cache persistence enqueue lock is poisoned"))?;
+        let command = self.next_command(operation, key, payload)?;
+        self.tx
+            .send(command)
+            .map_err(|error| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {error}"))
     }
 
     pub fn close(&mut self) {
@@ -392,33 +468,13 @@ impl RedisCacheDatabase {
         log::debug!("Closed");
     }
 
-    pub async fn flushdb(&mut self) {
-        if let Err(e) = redis::cmd(REDIS_FLUSHDB)
-            .query_async::<()>(&mut self.con)
-            .await
-        {
-            log::error!("Failed to flush database: {e:?}");
-        }
-    }
-
-    /// Sends a flush command through the background task channel and blocks
-    /// until it completes. Safe to call from any runtime context.
+    /// Rejects destructive cache flushing on the live Redis adapter.
     ///
     /// # Errors
     ///
-    /// Returns an error if the command channel is closed or the reply is lost.
+    /// Always returns an error because persisted execution state is append-preserving.
     pub fn flushdb_sync(&self) -> anyhow::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let cmd = DatabaseCommand {
-            op_type: DatabaseOperation::Flush(reply_tx),
-            key: None,
-            payload: None,
-        };
-        self.tx
-            .send(cmd)
-            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))?;
-        blocking_recv(&reply_rx).map_err(|e| anyhow::anyhow!("Failed to flush database: {e}"))?;
-        Ok(())
+        anyhow::bail!("destructive Redis cache flush is forbidden")
     }
 
     /// Retrieves all keys matching the given `pattern` from Redis for this trader.
@@ -485,11 +541,7 @@ impl RedisCacheDatabase {
     ///
     /// Returns an error if the command cannot be sent to the background task channel.
     pub fn insert(&self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Insert, key, payload);
-        match self.tx.send(op) {
-            Ok(()) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+        self.send_mutation(DatabaseOperation::Insert, key, payload)
     }
 
     /// Stores custom data in Redis (key format: `custom:<ts_init_020>:<uuid>`, value: full JSON).
@@ -515,11 +567,7 @@ impl RedisCacheDatabase {
     ///
     /// Returns an error if the command cannot be sent to the background task channel.
     pub fn update(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Update, key, payload);
-        match self.tx.send(op) {
-            Ok(()) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+        self.send_mutation(DatabaseOperation::Update, key, payload)
     }
 
     /// Sends a delete command for `key` with optional `payload` to Redis via the background task.
@@ -528,11 +576,7 @@ impl RedisCacheDatabase {
     ///
     /// Returns an error if the command cannot be sent to the background task channel.
     pub fn delete(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, payload);
-        match self.tx.send(op) {
-            Ok(()) => Ok(()),
-            Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
-        }
+        self.send_mutation(DatabaseOperation::Delete, key, payload)
     }
 
     /// Delete the given order from the database with full index cleanup.
@@ -545,9 +589,7 @@ impl RedisCacheDatabase {
 
         // Delete the order itself
         let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
-        self.tx
-            .send(op)
+        self.send_mutation(DatabaseOperation::Delete, key, None)
             .map_err(|e| anyhow::anyhow!("Failed to send delete order command: {e}"))?;
 
         // Delete from all order indexes
@@ -563,9 +605,7 @@ impl RedisCacheDatabase {
         for index_key in &index_keys {
             let key = (*index_key).to_string();
             let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.tx
-                .send(op)
+            self.send_mutation(DatabaseOperation::Delete, key, Some(payload))
                 .map_err(|e| anyhow::anyhow!("Failed to send delete order index command: {e}"))?;
         }
 
@@ -574,10 +614,10 @@ impl RedisCacheDatabase {
         for index_key in &hash_indexes {
             let key = (*index_key).to_string();
             let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete order hash index command: {e}")
-            })?;
+            self.send_mutation(DatabaseOperation::Delete, key, Some(payload))
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send delete order hash index command: {e}")
+                })?;
         }
 
         Ok(())
@@ -593,9 +633,7 @@ impl RedisCacheDatabase {
 
         // Delete the position itself
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
-        self.tx
-            .send(op)
+        self.send_mutation(DatabaseOperation::Delete, key, None)
             .map_err(|e| anyhow::anyhow!("Failed to send delete position command: {e}"))?;
 
         // Delete from all position indexes
@@ -608,10 +646,10 @@ impl RedisCacheDatabase {
         for index_key in &index_keys {
             let key = (*index_key).to_string();
             let payload = vec![position_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete position index command: {e}")
-            })?;
+            self.send_mutation(DatabaseOperation::Delete, key, Some(payload))
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send delete position index command: {e}")
+                })?;
         }
 
         Ok(())
@@ -643,15 +681,83 @@ fn blocking_recv<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
     }
 }
 
+async fn create_dedicated_write_connection(
+    config: &RedisCacheConfig,
+) -> anyhow::Result<MultiplexedConnection> {
+    log::debug!("Creating {CACHE_WRITE} dedicated redis connection");
+    let (redis_url, redacted_url) = get_redis_url(config);
+    log::debug!("Connecting to {redacted_url}");
+
+    let async_config = AsyncConnectionConfig::new()
+        .set_connection_timeout(Some(Duration::from_secs(u64::from(
+            config.connection_timeout,
+        ))))
+        .set_response_timeout(Some(Duration::from_secs(u64::from(
+            config.response_timeout,
+        ))));
+    let client = redis::Client::open(redis_url)?;
+    let mut connection = client
+        .get_multiplexed_async_connection_with_config(&async_config)
+        .await?;
+    verify_destructive_commands_denied(
+        &mut connection,
+        config.username.as_deref().unwrap_or("default"),
+    )
+    .await?;
+    Ok(connection)
+}
+
+async fn verify_destructive_commands_denied(
+    connection: &mut MultiplexedConnection,
+    username: &str,
+) -> anyhow::Result<()> {
+    for forbidden in [["FLUSH", "DB"].concat(), ["FLUSH", "ALL"].concat()] {
+        let result = redis::cmd("ACL")
+            .arg("DRYRUN")
+            .arg(username)
+            .arg(&forbidden)
+            .query_async::<String>(connection)
+            .await;
+
+        let detail = match result {
+            Ok(reply) => reply,
+            Err(error) => error.to_string(),
+        };
+        if !acl_reply_denies(&detail, &forbidden) {
+            anyhow::bail!(
+                "Redis ACL does not prove {forbidden} is denied for cache user {username}: {detail}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn acl_reply_denies(detail: &str, forbidden: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("no permissions") && detail.contains(&forbidden.to_ascii_lowercase())
+}
+
 async fn process_commands(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<DatabaseCommand>,
     trader_key: String,
     config: CacheConfig,
     database: RedisCacheConfig,
+    startup: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     log_task_started(CACHE_PROCESS);
 
-    let mut con = create_redis_connection(CACHE_WRITE, &database).await?;
+    let mut con = match create_dedicated_write_connection(&database).await {
+        Ok(connection) => {
+            let _ = startup.send(Ok(()));
+            connection
+        }
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            return Ok(());
+        }
+    };
+    let mut last_processed = PersistenceSequence::default();
+    let mut failure: Option<PersistenceError> = None;
 
     // Buffering
     let mut buffer: VecDeque<DatabaseCommand> = VecDeque::new();
@@ -674,6 +780,8 @@ async fn process_commands(
                     &mut con,
                     &trader_key,
                     config.encoding,
+                    &mut last_processed,
+                    &mut failure,
                 ).await;
 
                 if result.is_break() {
@@ -681,34 +789,48 @@ async fn process_commands(
                 }
             }
             () = &mut flush_timer, if !buffer_interval.is_zero() => {
-                flush_buffer(
+                match flush_buffer(
                     &mut buffer,
                     &mut con,
                     &trader_key,
                     config.encoding,
                     &mut flush_timer,
                     buffer_interval,
-                ).await;
+                ).await {
+                    Ok(sequence) if sequence > last_processed => last_processed = sequence,
+                    Ok(_) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
         }
     }
 
     // Drain any remaining messages
-    if !buffer.is_empty() {
-        drain_buffer(&mut con, &trader_key, config.encoding, &mut buffer).await;
+    if !buffer.is_empty()
+        && let Err(error) = drain_buffer(&mut con, &trader_key, config.encoding, &mut buffer).await
+    {
+        failure.get_or_insert(error);
     }
 
     log_task_stopped(CACHE_PROCESS);
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the worker state is passed explicitly to preserve mutation and fence ordering"
+)]
 async fn handle_command(
     maybe_cmd: Option<DatabaseCommand>,
     buffer: &mut VecDeque<DatabaseCommand>,
     buffer_interval: Duration,
-    con: &mut ConnectionManager,
+    con: &mut MultiplexedConnection,
     trader_key: &str,
     encoding: SerializationEncoding,
+    last_processed: &mut PersistenceSequence,
+    failure: &mut Option<PersistenceError>,
 ) -> ControlFlow<()> {
     let Some(cmd) = maybe_cmd else {
         log::debug!("Command channel closed");
@@ -720,19 +842,43 @@ async fn handle_command(
     match cmd.op_type {
         DatabaseOperation::Close => {
             if !buffer.is_empty() {
-                drain_buffer(con, trader_key, encoding, buffer).await;
+                match drain_buffer(con, trader_key, encoding, buffer).await {
+                    Ok(sequence) => *last_processed = sequence,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
             return ControlFlow::Break(());
         }
-        DatabaseOperation::Flush(reply_tx) => {
+        DatabaseOperation::Fence {
+            requested_through,
+            timeout,
+            reply,
+        } => {
             if !buffer.is_empty() {
-                drain_buffer(con, trader_key, encoding, buffer).await;
+                match drain_buffer(con, trader_key, encoding, buffer).await {
+                    Ok(sequence) => *last_processed = sequence,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
 
-            if let Err(e) = redis::cmd(REDIS_FLUSHDB).query_async::<()>(con).await {
-                log::error!("Failed to flush database: {e:?}");
+            let result = if let Some(error) = failure.clone() {
+                Err(error)
+            } else if *last_processed < requested_through {
+                Err(PersistenceError::InvalidReply(format!(
+                    "worker processed through {} but fence requested {}",
+                    last_processed.get(),
+                    requested_through.get()
+                )))
+            } else {
+                wait_for_aof(con, requested_through, timeout).await
+            };
+            if let Err(error) = reply.send(result) {
+                log::error!("Failed to return cache persistence fence result: {error}");
             }
-            let _ = reply_tx.send(());
             return ControlFlow::Continue(());
         }
         _ => {}
@@ -741,7 +887,12 @@ async fn handle_command(
     buffer.push_back(cmd);
 
     if buffer_interval.is_zero() {
-        drain_buffer(con, trader_key, encoding, buffer).await;
+        match drain_buffer(con, trader_key, encoding, buffer).await {
+            Ok(sequence) => *last_processed = sequence,
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
     }
 
     ControlFlow::Continue(())
@@ -749,41 +900,41 @@ async fn handle_command(
 
 async fn flush_buffer(
     buffer: &mut VecDeque<DatabaseCommand>,
-    con: &mut ConnectionManager,
+    con: &mut MultiplexedConnection,
     trader_key: &str,
     encoding: SerializationEncoding,
     flush_timer: &mut Pin<&mut tokio::time::Sleep>,
     buffer_interval: Duration,
-) {
+) -> Result<PersistenceSequence, PersistenceError> {
+    let mut through = PersistenceSequence::default();
     if !buffer.is_empty() {
-        drain_buffer(con, trader_key, encoding, buffer).await;
+        through = drain_buffer(con, trader_key, encoding, buffer).await?;
     }
     flush_timer
         .as_mut()
         .reset(tokio::time::Instant::now() + buffer_interval);
+    Ok(through)
 }
 
 async fn drain_buffer(
-    conn: &mut ConnectionManager,
+    conn: &mut MultiplexedConnection,
     trader_key: &str,
     encoding: SerializationEncoding,
     buffer: &mut VecDeque<DatabaseCommand>,
-) {
+) -> Result<PersistenceSequence, PersistenceError> {
     let mut pipe = redis::pipe();
     pipe.atomic();
     let mut has_pending_ops = false;
+    let mut through = PersistenceSequence::default();
 
     for msg in buffer.drain(..) {
+        through = msg.sequence;
         let Some(key) = msg.key else {
-            log::error!("Null key found for message: {msg:?}");
-            continue;
+            return Err(mutation_error(through, "command has no key"));
         };
         let collection = match get_collection_key(&key) {
             Ok(collection) => collection,
-            Err(e) => {
-                log::error!("{e}");
-                continue; // Continue to next message
-            }
+            Err(error) => return Err(mutation_error(through, error)),
         };
 
         let key = format!("{trader_key}{REDIS_DELIMITER}{key}");
@@ -792,51 +943,43 @@ async fn drain_buffer(
             DatabaseOperation::Insert => {
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing INSERT for collection: {collection}, key: {key}");
-                    if let Err(e) = insert(&mut pipe, collection, &key, &payload) {
-                        log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
-                    }
+                    insert(&mut pipe, collection, &key, &payload)
+                        .map_err(|error| mutation_error(through, error))?;
+                    has_pending_ops = true;
                 } else {
-                    log::error!("Null `payload` for `insert`");
+                    return Err(mutation_error(through, "INSERT has no payload"));
                 }
             }
             DatabaseOperation::Update => {
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing UPDATE for collection: {collection}, key: {key}");
-                    if let Err(e) = update(&mut pipe, collection, &key, &payload) {
-                        log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
-                    }
+                    update(&mut pipe, collection, &key, &payload)
+                        .map_err(|error| mutation_error(through, error))?;
+                    has_pending_ops = true;
                 } else {
-                    log::error!("Null `payload` for `update`");
+                    return Err(mutation_error(through, "UPDATE has no payload"));
                 }
             }
             DatabaseOperation::UpdateOrder => {
-                flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
+                flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops, through).await?;
 
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing UPDATE_ORDER for key: {key}");
-                    if let Err(e) =
-                        update_order_event_log(conn, trader_key, encoding, &key, &payload).await
-                    {
-                        log::error!("{e}");
-                    }
+                    update_order_event_log(conn, trader_key, encoding, &key, &payload)
+                        .await
+                        .map_err(|error| mutation_error(through, error))?;
                 } else {
-                    log::error!("Null `payload` for `update_order`");
+                    return Err(mutation_error(through, "UPDATE_ORDER has no payload"));
                 }
             }
             DatabaseOperation::ReplaceList => {
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing REPLACE_LIST for key: {key}");
-                    if let Err(e) = replace_list_operation(&mut pipe, collection, &key, &payload) {
-                        log::error!("{e}");
-                    } else {
-                        has_pending_ops = true;
-                    }
+                    replace_list_operation(&mut pipe, collection, &key, &payload)
+                        .map_err(|error| mutation_error(through, error))?;
+                    has_pending_ops = true;
                 } else {
-                    log::error!("Null `payload` for `replace_list`");
+                    return Err(mutation_error(through, "REPLACE_LIST has no payload"));
                 }
             }
             DatabaseOperation::Delete => {
@@ -847,40 +990,86 @@ async fn drain_buffer(
                     msg.payload.as_ref().map(std::vec::Vec::len)
                 );
                 // `payload` can be `None` for a delete operation
-                if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
-                    log::error!("{e}");
-                } else {
-                    has_pending_ops = true;
-                }
+                delete(&mut pipe, collection, &key, msg.payload)
+                    .map_err(|error| mutation_error(through, error))?;
+                has_pending_ops = true;
             }
             DatabaseOperation::Close => panic!("Close command should not be drained"),
-            DatabaseOperation::Flush(_) => panic!("Flush command should not be drained"),
+            DatabaseOperation::Fence { .. } => panic!("Fence command should not be drained"),
         }
     }
 
-    flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
+    flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops, through).await?;
+    Ok(through)
 }
 
 async fn flush_pending_pipeline(
-    conn: &mut ConnectionManager,
+    conn: &mut MultiplexedConnection,
     pipe: &mut Pipeline,
     has_pending_ops: &mut bool,
-) {
+    through: PersistenceSequence,
+) -> Result<(), PersistenceError> {
     if !*has_pending_ops {
-        return;
+        return Ok(());
     }
 
-    if let Err(e) = pipe.query_async::<()>(conn).await {
-        log::error!("{e}");
-    }
+    pipe.query_async::<()>(conn)
+        .await
+        .map_err(|error| mutation_error(through, error))?;
 
     *pipe = redis::pipe();
     pipe.atomic();
     *has_pending_ops = false;
+    Ok(())
+}
+
+fn mutation_error(through: PersistenceSequence, error: impl std::fmt::Display) -> PersistenceError {
+    PersistenceError::Mutation {
+        through,
+        detail: error.to_string(),
+    }
+}
+
+async fn wait_for_aof(
+    conn: &mut MultiplexedConnection,
+    through: PersistenceSequence,
+    timeout: Duration,
+) -> Result<PersistenceReceipt, PersistenceError> {
+    const REDIS_WAITAOF_TIMEOUT_MS: u64 = 1_000;
+
+    let mut command = redis::cmd("WAITAOF");
+    command.arg(1_u32).arg(1_u32).arg(REDIS_WAITAOF_TIMEOUT_MS);
+    let wait = command.query_async::<(u32, u32)>(conn);
+    let (local_aofs_fsynced, replica_aofs_fsynced) = tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| PersistenceError::Timeout(timeout))?
+        .map_err(|error| mutation_error(through, error))?;
+
+    if local_aofs_fsynced == 0 {
+        return Err(PersistenceError::LocalAofNotFsynced);
+    }
+    if replica_aofs_fsynced == 0 {
+        return Err(PersistenceError::ReplicaAofNotFsynced);
+    }
+
+    let completed_at = Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .map(UnixNanos::new)
+        .ok_or_else(|| {
+            PersistenceError::InvalidReply("clock outside UnixNanos range".to_string())
+        })?;
+
+    Ok(PersistenceReceipt {
+        through,
+        local_aofs_fsynced,
+        replica_aofs_fsynced,
+        completed_at,
+    })
 }
 
 async fn update_order_event_log(
-    conn: &mut ConnectionManager,
+    conn: &mut MultiplexedConnection,
     trader_key: &str,
     encoding: SerializationEncoding,
     key: &str,
@@ -1210,11 +1399,7 @@ impl RedisCacheDatabaseAdapter {
         key: String,
         payload: Option<Vec<Bytes>>,
     ) -> anyhow::Result<()> {
-        let op = DatabaseCommand::new(op_type, key, payload);
-        self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
+        self.database.send_mutation(op_type, key, payload)
     }
 
     fn append_list(&self, key: String, payload: Bytes) -> anyhow::Result<()> {
@@ -1301,6 +1486,38 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
     fn flush(&mut self) -> anyhow::Result<()> {
         self.database.flushdb_sync()
+    }
+
+    fn fence_current(&self, timeout: Duration) -> Result<PersistenceReceipt, PersistenceError> {
+        let enqueue_guard = self.database.enqueue_lock.lock().map_err(|_| {
+            PersistenceError::ReplyChannel("cache persistence enqueue lock is poisoned".to_string())
+        })?;
+        let requested_through =
+            PersistenceSequence::new(self.database.next_sequence.load(Ordering::SeqCst));
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let command = DatabaseCommand {
+            sequence: requested_through,
+            op_type: DatabaseOperation::Fence {
+                requested_through,
+                timeout,
+                reply,
+            },
+            key: None,
+            payload: None,
+        };
+        self.database.tx.send(command).map_err(|error| {
+            PersistenceError::ReplyChannel(format!("{FAILED_TX_CHANNEL}: {error}"))
+        })?;
+        drop(enqueue_guard);
+
+        let receive = || receiver.recv_timeout(timeout.saturating_add(Duration::from_secs(1)));
+        let result = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(receive)
+        } else {
+            receive()
+        };
+
+        result.map_err(|error| PersistenceError::ReplyChannel(error.to_string()))?
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
@@ -1730,20 +1947,14 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
     fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()> {
         let key = format!("{ACTORS}{REDIS_DELIMITER}{component_id}{REDIS_DELIMITER}state");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
+            .send_mutation(DatabaseOperation::Delete, key, None)
     }
 
     fn delete_strategy(&self, component_id: &StrategyId) -> anyhow::Result<()> {
         let key = format!("{STRATEGIES}{REDIS_DELIMITER}{component_id}{REDIS_DELIMITER}state");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
+            .send_mutation(DatabaseOperation::Delete, key, None)
     }
 
     fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
@@ -1755,10 +1966,8 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         // Delete the order itself
         let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
         log::debug!("Deleting order key: {key}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.database
-            .tx
-            .send(op)
+            .send_mutation(DatabaseOperation::Delete, key, None)
             .map_err(|e| anyhow::anyhow!("Failed to send delete order command: {e}"))?;
 
         // Delete from all order indexes
@@ -1775,10 +1984,8 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             let key = (*index_key).to_string();
             log::debug!("Deleting from index: {key} (order_id: {client_order_id})");
             let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
             self.database
-                .tx
-                .send(op)
+                .send_mutation(DatabaseOperation::Delete, key, Some(payload))
                 .map_err(|e| anyhow::anyhow!("Failed to send delete order index command: {e}"))?;
         }
 
@@ -1788,10 +1995,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             let key = (*index_key).to_string();
             log::debug!("Deleting from hash index: {key} (order_id: {client_order_id})");
             let payload = vec![order_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.database.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete order hash index command: {e}")
-            })?;
+            self.database
+                .send_mutation(DatabaseOperation::Delete, key, Some(payload))
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send delete order hash index command: {e}")
+                })?;
         }
 
         log::debug!("Sent all delete commands for order: {client_order_id}");
@@ -1803,10 +2011,8 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
         // Delete the position itself
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.database
-            .tx
-            .send(op)
+            .send_mutation(DatabaseOperation::Delete, key, None)
             .map_err(|e| anyhow::anyhow!("Failed to send delete position command: {e}"))?;
 
         // Delete from all position indexes
@@ -1819,10 +2025,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         for index_key in &index_keys {
             let key = (*index_key).to_string();
             let payload = vec![position_id_bytes.clone()];
-            let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
-            self.database.tx.send(op).map_err(|e| {
-                anyhow::anyhow!("Failed to send delete position index command: {e}")
-            })?;
+            self.database
+                .send_mutation(DatabaseOperation::Delete, key, Some(payload))
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to send delete position index command: {e}")
+                })?;
         }
 
         Ok(())
@@ -1891,15 +2098,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         let client_order_id = order_event.client_order_id();
         let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
         let payload = DatabaseQueries::serialize_payload(self.encoding(), order_event)?;
-        let op = DatabaseCommand::new(
+        self.database.send_mutation(
             DatabaseOperation::UpdateOrder,
             key,
             Some(vec![Bytes::from(payload)]),
-        );
-        self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
+        )
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
@@ -1990,5 +2193,34 @@ mod tests {
     fn test_get_collection_key_invalid() {
         let key = "no_delimiter";
         assert!(get_collection_key(key).is_err());
+    }
+
+    #[test]
+    fn cache_adapter_contains_no_destructive_redis_flush_command() {
+        let sources = [
+            include_str!("cache.rs"),
+            include_str!("mod.rs"),
+            include_str!("../python/redis/cache.rs"),
+        ];
+        let destructive_command = ["FLUSH", "DB"].concat();
+        let destructive_all_command = ["FLUSH", "ALL"].concat();
+
+        for source in sources {
+            assert!(!source.contains(&destructive_command));
+            assert!(!source.contains(&destructive_all_command));
+        }
+    }
+
+    #[test]
+    fn redis_acl_dryrun_denial_is_accepted_in_string_or_error_form() {
+        assert!(acl_reply_denies(
+            "User cache has no permissions to run the 'flushdb' command",
+            &["FLUSH", "DB"].concat(),
+        ));
+        assert!(!acl_reply_denies("OK", &["FLUSH", "DB"].concat()));
+        assert!(!acl_reply_denies(
+            "NOPERM this user has no permissions to run the 'acl|dryrun' command",
+            &["FLUSH", "DB"].concat(),
+        ));
     }
 }

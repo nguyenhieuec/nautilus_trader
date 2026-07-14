@@ -29,7 +29,7 @@ use std::{
     fmt::{Debug, Display},
     rc::Rc,
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use ahash::AHashSet;
@@ -37,10 +37,14 @@ use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
-    cache::{Cache, CacheSnapshotRef, PositionRef},
+    cache::{Cache, CacheSnapshotRef, PositionRef, database::CacheLoadError},
     clients::ExecutionClient,
     clock::Clock,
     enums::LogColor,
+    execution_persistence::{
+        ExecutionWriteIdentity, ExecutionWriteKind, PersistedExecutionWriteActivatorHandle,
+        StagedExecutionWrite,
+    },
     generators::position_id::PositionIdGenerator,
     log_info,
     logging::{CMD, EVT, RECV, SEND},
@@ -140,6 +144,8 @@ pub struct ExecutionEngine {
     filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
     execution_anomaly_sink: Option<Arc<dyn ExecutionAnomalySink>>,
+    persisted_write_activator: Option<PersistedExecutionWriteActivatorHandle>,
+    staged_writes: RefCell<HashMap<UUID4, (StagedExecutionWrite, ExecutionWriteIdentity)>>,
 }
 
 impl Debug for ExecutionEngine {
@@ -182,6 +188,8 @@ impl ExecutionEngine {
             filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
             execution_anomaly_sink: None,
+            persisted_write_activator: None,
+            staged_writes: RefCell::new(HashMap::new()),
         }
     }
 
@@ -342,6 +350,22 @@ impl ExecutionEngine {
     /// Installs the synchronous sink for rejected venue-exposure anomalies.
     pub fn set_execution_anomaly_sink(&mut self, sink: Option<Arc<dyn ExecutionAnomalySink>>) {
         self.execution_anomaly_sink = sink;
+    }
+
+    /// Installs the application-owned persisted-write activator.
+    pub fn set_persisted_execution_write_activator(
+        &mut self,
+        activator: Option<PersistedExecutionWriteActivatorHandle>,
+    ) {
+        self.persisted_write_activator = activator;
+    }
+
+    /// Returns the installed persisted-write activator.
+    #[must_use]
+    pub fn persisted_execution_write_activator(
+        &self,
+    ) -> Option<PersistedExecutionWriteActivatorHandle> {
+        self.persisted_write_activator.clone()
     }
 
     #[must_use]
@@ -1148,7 +1172,9 @@ impl ExecutionEngine {
         let own_book_entries: Vec<(InstrumentId, OwnBookOrder)> = {
             let mut cache = self.cache.borrow_mut();
             cache.build_index();
-            let _ = cache.check_integrity();
+            if !cache.check_integrity() {
+                return Err(CacheLoadError::Integrity.into());
+            }
 
             if self.config.manage_own_order_books {
                 cache
@@ -2070,6 +2096,56 @@ impl ExecutionEngine {
         self.execute_command(command);
     }
 
+    /// Executes a venue mutation carrying an opaque stage which must activate after persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for read-only, bulk-cancel, or duplicate-command paths. The staged
+    /// command remains unpublished unless its exact persistence receipt activates successfully.
+    pub fn execute_staged(
+        &self,
+        command: TradingCommand,
+        stage: StagedExecutionWrite,
+    ) -> anyhow::Result<()> {
+        let kind = match &command {
+            TradingCommand::SubmitOrder(_) => ExecutionWriteKind::Submit,
+            TradingCommand::SubmitOrderList(_) => ExecutionWriteKind::SubmitList,
+            TradingCommand::ModifyOrder(_) => ExecutionWriteKind::Modify,
+            TradingCommand::ModifyOrders(_) => ExecutionWriteKind::BatchModify,
+            TradingCommand::CancelOrder(_) => ExecutionWriteKind::Cancel,
+            TradingCommand::CancelOrders(_) => ExecutionWriteKind::BatchCancel,
+            TradingCommand::CancelAllOrders(_) => {
+                anyhow::bail!("staged CancelAll is forbidden; expand to exact cancellations")
+            }
+            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {
+                anyhow::bail!("read-only execution commands cannot carry a write stage")
+            }
+        };
+        let client_order_id = match &command {
+            TradingCommand::SubmitOrder(command) => Some(command.client_order_id),
+            TradingCommand::ModifyOrder(command) => Some(command.client_order_id),
+            TradingCommand::CancelOrder(command) => Some(command.client_order_id),
+            _ => None,
+        };
+        let identity = ExecutionWriteIdentity {
+            command_id: command.command_id(),
+            client_order_id,
+            instrument_id: command.instrument_id(),
+            kind,
+            expires_at: stage.expires_at,
+        };
+        if self
+            .staged_writes
+            .borrow_mut()
+            .insert(command.command_id(), (stage, identity))
+            .is_some()
+        {
+            anyhow::bail!("duplicate staged command ID {}", command.command_id());
+        }
+        self.execute_command(command);
+        Ok(())
+    }
+
     /// Processes an order event, updating internal state and routing as needed.
     pub fn process(&mut self, event: &OrderEventAny) {
         self.handle_event(event);
@@ -2165,21 +2241,26 @@ impl ExecutionEngine {
             log::debug!("{RECV}{CMD} {command:?}");
         }
 
+        if let Err(reason) = self.validate_command_origin(&command) {
+            log::error!("{reason}: command={command:?}");
+            self.reject_pending_staged_write(command.command_id(), &reason);
+            self.deny_routing_command(&command, &reason);
+            return;
+        }
+
         if let Some(cid) = command.client_id()
             && self.external_clients.contains(&cid)
         {
+            if let Err(error) = self.activate_pending_staged_write(command.command_id()) {
+                log::error!("Cannot activate persisted external execution command: {error}");
+                return;
+            }
             let topic = format!("commands.trading.{cid}");
             msgbus::publish_any(topic.into(), &command);
 
             if self.config.debug {
                 log::debug!("Skipping execution command for external client {cid}: {command:?}");
             }
-            return;
-        }
-
-        if let Err(reason) = self.validate_command_origin(&command) {
-            log::error!("{reason}: command={command:?}");
-            self.deny_routing_command(&command, &reason);
             return;
         }
 
@@ -2198,6 +2279,8 @@ impl ExecutionEngine {
                 routing_context,
             }
             .to_string();
+
+            self.reject_pending_staged_write(command.command_id(), &reason);
 
             match command {
                 TradingCommand::SubmitOrder(cmd) => {
@@ -2225,6 +2308,15 @@ impl ExecutionEngine {
 
             return;
         };
+
+        if !matches!(
+            command,
+            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_)
+        ) && let Err(error) = self.activate_pending_staged_write(command.command_id())
+        {
+            log::error!("Cannot activate persisted execution command: {error}");
+            return;
+        }
 
         match command {
             TradingCommand::SubmitOrder(cmd) => self.handle_submit_order(client, cmd),
@@ -2418,6 +2510,11 @@ impl ExecutionEngine {
             self.create_order_state_snapshot(&order);
         }
 
+        if let Err(error) = self.activate_pending_staged_write(cmd.command_id) {
+            log::error!("Cannot activate persisted submit command: {error}");
+            return;
+        }
+
         let order_venue = order.instrument_id().venue;
         let client_venue = client.venue();
         if !client.handles_order_venue(order_venue) {
@@ -2515,6 +2612,11 @@ impl ExecutionEngine {
                     self.create_order_state_snapshot(order);
                 }
             }
+        }
+
+        if let Err(error) = self.activate_pending_staged_write(cmd.command_id) {
+            log::error!("Cannot activate persisted submit-list command: {error}");
+            return;
         }
 
         if orders.len() != cmd.order_list.client_order_ids.len() {
@@ -2653,7 +2755,77 @@ impl ExecutionEngine {
             return None;
         }
 
+        if let Err(error) = self.fence_persisted_state() {
+            log::error!(
+                "Cannot fence reconstructed order {client_order_id} before submission: {error}"
+            );
+            return None;
+        }
+
         Some(order)
+    }
+
+    fn fence_persisted_state(
+        &self,
+    ) -> Result<
+        Option<nautilus_common::cache::database::PersistenceReceipt>,
+        nautilus_common::cache::database::PersistenceError,
+    > {
+        if !self.cache.borrow().has_backing() {
+            return Ok(None);
+        }
+
+        match self
+            .cache
+            .borrow()
+            .fence_database_current(Duration::from_secs(1))
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(error) => {
+                if let Some(activator) = &self.persisted_write_activator {
+                    activator.halt(&error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn activate_staged_write(
+        &self,
+        stage: StagedExecutionWrite,
+        identity: ExecutionWriteIdentity,
+    ) -> anyhow::Result<()> {
+        let activator = self.persisted_write_activator.as_ref().ok_or({
+            nautilus_common::execution_persistence::ExecutionWriteActivationError::MissingActivator
+        })?;
+        let receipt = self
+            .fence_persisted_state()?
+            .ok_or(nautilus_common::cache::database::PersistenceError::MissingBacking)?;
+        if let Err(error) = activator.activate_persisted(stage.token, identity, receipt) {
+            activator.halt_activation(&error);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn activate_pending_staged_write(&self, command_id: UUID4) -> anyhow::Result<()> {
+        let Some((stage, identity)) = self.staged_writes.borrow_mut().remove(&command_id) else {
+            return Ok(());
+        };
+        self.activate_staged_write(stage, identity)
+    }
+
+    fn reject_pending_staged_write(&self, command_id: UUID4, reason: &str) {
+        let Some(_) = self.staged_writes.borrow_mut().remove(&command_id) else {
+            return;
+        };
+        if let Some(activator) = &self.persisted_write_activator {
+            let error =
+                nautilus_common::execution_persistence::ExecutionWriteActivationError::Rejected(
+                    reason.to_string(),
+                );
+            activator.halt_activation(&error);
+        }
     }
 
     fn handle_modify_order(&self, client: &dyn ExecutionClient, cmd: ModifyOrder) {
@@ -2920,6 +3092,12 @@ impl ExecutionEngine {
                 };
 
                 let position_events = self.handle_order_fill(&order, fill, oms_type);
+                if let Err(error) = self.fence_persisted_state() {
+                    log::error!(
+                        "Persistence fence failed after fill position update; no fill-dependent action was published: {error}"
+                    );
+                    return;
+                }
                 self.publish_order_event(&event);
                 self.publish_position_events(position_events);
             }
@@ -2953,10 +3131,6 @@ impl ExecutionEngine {
         fill.position_id = Some(position_id);
         let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id);
 
-        let event = OrderEventAny::Filled(fill);
-        let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
-        msgbus::send_order_event(portfolio_endpoint, event.clone());
-
         let position_events = if duplicate_position_fill {
             log::warn!(
                 "Duplicate leg fill: {} trade_id={} already applied to position {}, skipping position update",
@@ -2968,6 +3142,17 @@ impl ExecutionEngine {
         } else {
             self.handle_position_update(&instrument, fill, oms_type)
         };
+
+        if let Err(error) = self.fence_persisted_state() {
+            log::error!(
+                "Persistence fence failed for leg fill; no fill-dependent action was published: {error}"
+            );
+            return;
+        }
+
+        let event = OrderEventAny::Filled(fill);
+        let portfolio_endpoint = MessagingSwitchboard::portfolio_update_order();
+        msgbus::send_order_event(portfolio_endpoint, event.clone());
         self.publish_order_event(&event);
         self.publish_position_events(position_events);
     }
@@ -3354,6 +3539,13 @@ impl ExecutionEngine {
                 return None;
             }
         };
+
+        if let Err(error) = self.fence_persisted_state() {
+            log::error!(
+                "Persistence fence failed for order event {event}; no dependent action was published: {error}"
+            );
+            return None;
+        }
 
         if self.config.manage_own_order_books && should_handle_own_book_order(&order) {
             let needs_own_book = {
@@ -3995,6 +4187,13 @@ impl ExecutionEngine {
                 return;
             }
         };
+
+        if let Err(error) = self.fence_persisted_state() {
+            log::error!(
+                "Persistence fence failed for denied order; denial was not published: {error}"
+            );
+            return;
+        }
 
         let topic = switchboard::get_event_order_topic(order.strategy_id());
         msgbus::publish_order_event(topic, &event);

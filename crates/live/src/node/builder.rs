@@ -18,9 +18,10 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, sync::Arc, time::Duration};
 
 use nautilus_common::{
-    cache::CacheConfig,
+    cache::{CacheConfig, database::CacheDatabaseAdapter},
     clock::Clock,
     enums::Environment,
+    execution_persistence::PersistedExecutionWriteActivatorHandle,
     factories::{
         ClientConfig, DataClientFactory, ExecutionClientFactory, SimulatedExecutionClientFactory,
     },
@@ -94,6 +95,8 @@ pub struct LiveNodeBuilder {
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
     external_msgbus_ingress: Option<ExternalMessageBusIngress>,
     execution_anomaly_sink: Option<Arc<dyn ExecutionAnomalySink>>,
+    cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+    persisted_write_activator: Option<PersistedExecutionWriteActivatorHandle>,
 }
 
 impl Debug for LiveNodeBuilder {
@@ -118,6 +121,11 @@ impl Debug for LiveNodeBuilder {
             .field(
                 "external_msgbus_ingress",
                 &self.external_msgbus_ingress.is_some(),
+            )
+            .field("cache_database", &self.cache_database.is_some())
+            .field(
+                "persisted_write_activator",
+                &self.persisted_write_activator.is_some(),
             )
             .finish_non_exhaustive()
     }
@@ -156,6 +164,8 @@ impl LiveNodeBuilder {
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
             execution_anomaly_sink: None,
+            cache_database: None,
+            persisted_write_activator: None,
         })
     }
 
@@ -185,6 +195,8 @@ impl LiveNodeBuilder {
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
             execution_anomaly_sink: None,
+            cache_database: None,
+            persisted_write_activator: None,
         })
     }
 
@@ -299,6 +311,23 @@ impl LiveNodeBuilder {
     #[must_use]
     pub fn with_cache_config(mut self, config: CacheConfig) -> Self {
         self.config.cache = Some(config);
+        self
+    }
+
+    /// Installs the durable cache database before any client factory is constructed.
+    #[must_use]
+    pub fn with_cache_database(mut self, database: Box<dyn CacheDatabaseAdapter>) -> Self {
+        self.cache_database = Some(database);
+        self
+    }
+
+    /// Installs the application-owned two-phase persisted-write activator.
+    #[must_use]
+    pub fn with_persisted_execution_write_activator(
+        mut self,
+        activator: PersistedExecutionWriteActivatorHandle,
+    ) -> Self {
+        self.persisted_write_activator = Some(activator);
         self
     }
 
@@ -506,6 +535,24 @@ impl LiveNodeBuilder {
 
         self.config.validate_runtime_support()?;
 
+        if self
+            .config
+            .cache
+            .as_ref()
+            .is_some_and(|config| config.flush_on_start)
+        {
+            anyhow::bail!("flush_on_start=true is forbidden for a live node");
+        }
+
+        if self.cache_database.is_some()
+            && !self.exec_client_factories.is_empty()
+            && self.persisted_write_activator.is_none()
+        {
+            anyhow::bail!(
+                "a durable venue-capable node requires a persisted execution write activator"
+            );
+        }
+
         if !self.config.exec_engine.allow_overfills
             && !self.exec_client_factories.is_empty()
             && self.execution_anomaly_sink.is_none()
@@ -541,10 +588,18 @@ impl LiveNodeBuilder {
                 .with_event_store_factory(self.event_store_factory.take()),
         )?;
 
+        if let Some(database) = self.cache_database.take() {
+            kernel.cache().borrow_mut().set_database(database);
+        }
+
         kernel
             .exec_engine
             .borrow_mut()
             .set_execution_anomaly_sink(self.execution_anomaly_sink.take());
+        kernel
+            .exec_engine
+            .borrow_mut()
+            .set_persisted_execution_write_activator(self.persisted_write_activator.take());
 
         self.install_external_msgbus_factory(&kernel)?;
 
@@ -714,6 +769,32 @@ fn configured_venues(routing: &RoutingConfig) -> Option<Vec<Venue>> {
             .map(|venue| Venue::from(venue.as_str()))
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_destructive_cache_flush_on_start() {
+        let config = LiveNodeConfig {
+            cache: Some(CacheConfig {
+                flush_on_start: true,
+                ..CacheConfig::default()
+            }),
+            ..LiveNodeConfig::default()
+        };
+
+        let error = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("flush_on_start=true is forbidden")
+        );
+    }
 }
 
 impl ExternalMessageBusIngress {
