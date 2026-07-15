@@ -501,28 +501,46 @@ impl BinanceSpotExecutionClient {
             },
         );
 
-        if self.config.use_ws_order_transport && self.ws_trading_active() {
+        anyhow::ensure!(
+            !self.config.use_ws_order_transport || self.ws_trading_active(),
+            "Binance Spot WebSocket order transport is required but inactive"
+        );
+        if self.config.use_ws_order_transport {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
+            let write_gate = self.write_gate.clone();
             let params =
                 build_new_order_params(&order, client_order_id, is_post_only, is_quote_quantity)?;
-
-            // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
-            dispatch_state.pending_requests.insert(
-                request_id.clone(),
-                PendingRequest {
-                    client_order_id,
-                    venue_order_id: None,
-                    operation: PendingOperation::Place,
-                },
-            );
+            let mut ws_payload = final_payload;
+            ws_payload.transport = ExecutionTransportTargetViewV1::WebSocketApi {
+                method: "order.place".to_string(),
+                recv_window_ms: 5_000,
+            };
 
             self.spawn_task("submit_order_ws", async move {
-                if let Err(e) = ws_client
-                    .place_order_with_id(request_id.clone(), params)
-                    .await
-                {
+                let write_gate = write_gate.ok_or(ExecutionWriteGateError::MissingGate)?;
+                ws_payload.validate_first_release(&write_context)?;
+                let permit = write_gate.acquire(&write_context, &ws_payload).await?;
+
+                // Pre-register immediately before sending so the response cannot race the insert.
+                dispatch_state.pending_requests.insert(
+                    request_id.clone(),
+                    PendingRequest {
+                        client_order_id,
+                        venue_order_id: None,
+                        operation: PendingOperation::Place,
+                    },
+                );
+                let result = ws_client
+                    .place_order_authorized_with_id(
+                        request_id.clone(),
+                        params,
+                        permit,
+                        ws_payload,
+                    )
+                    .await;
+                if let Err(e) = result {
                     dispatch_state.pending_requests.remove(&request_id);
                     log::warn!(
                         "WS submit request failed for {client_order_id}, awaiting reconciliation: {e}"
@@ -672,27 +690,40 @@ impl BinanceSpotExecutionClient {
             kind: ExecutionWriteKind::Cancel,
         };
 
-        if self.config.use_ws_order_transport && self.ws_trading_active() {
+        anyhow::ensure!(
+            !self.config.use_ws_order_transport || self.ws_trading_active(),
+            "Binance Spot WebSocket order transport is required but inactive"
+        );
+        if self.config.use_ws_order_transport {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
+            let write_gate = self.write_gate.clone();
             let params = build_cancel_order_params(&command);
-
-            // Pre-register before sending to avoid response racing the insert
             let request_id = ws_client.next_request_id();
-            dispatch_state.pending_requests.insert(
-                request_id.clone(),
-                PendingRequest {
-                    client_order_id: command.client_order_id,
-                    venue_order_id: command.venue_order_id,
-                    operation: PendingOperation::Cancel,
-                },
-            );
+            let mut ws_payload = final_payload;
+            ws_payload.transport = ExecutionTransportTargetViewV1::WebSocketApi {
+                method: "order.cancel".to_string(),
+                recv_window_ms: 5_000,
+            };
 
             self.spawn_task("cancel_order_ws", async move {
-                if let Err(e) = ws_client
-                    .cancel_order_with_id(request_id.clone(), params)
-                    .await
-                {
+                let write_gate = write_gate.ok_or(ExecutionWriteGateError::MissingGate)?;
+                ws_payload.validate_first_release(&write_context)?;
+                let permit = write_gate.acquire(&write_context, &ws_payload).await?;
+
+                // Pre-register immediately before sending so the response cannot race the insert.
+                dispatch_state.pending_requests.insert(
+                    request_id.clone(),
+                    PendingRequest {
+                        client_order_id: command.client_order_id,
+                        venue_order_id: command.venue_order_id,
+                        operation: PendingOperation::Cancel,
+                    },
+                );
+                let result = ws_client
+                    .cancel_order_authorized_with_id(request_id.clone(), params, permit, ws_payload)
+                    .await;
+                if let Err(e) = result {
                     dispatch_state.pending_requests.remove(&request_id);
                     log::warn!(
                         "WS cancel request failed for {}, awaiting reconciliation: {e}",

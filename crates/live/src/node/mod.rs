@@ -469,7 +469,8 @@ impl LiveNode {
             EngineConnectionStatus::Connected => {}
             EngineConnectionStatus::TimedOut => {
                 log::error!("Cannot start trader: engine client(s) not connected");
-                self.handle.set_state(NodeState::Running);
+                self.abort_startup("Engine client connection timed out during startup")
+                    .await?;
                 return Ok(());
             }
             EngineConnectionStatus::StopRequested => {
@@ -847,6 +848,24 @@ impl LiveNode {
     ///
     /// Returns an error if the node fails to start or encounters a runtime error.
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        self.run_with_startup_hook(std::future::ready(Ok(()))).await
+    }
+
+    /// Run the live node and publish an external startup resource only after reconciliation.
+    ///
+    /// The supplied future is first polled after cache loading, client connection,
+    /// strict startup reconciliation, trader startup, and the transition to
+    /// [`NodeState::Running`]. Its returned value is retained until node shutdown,
+    /// which lets launchers safely publish process-local control endpoints without
+    /// opening them during the startup window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if node startup, the startup hook, or runtime shutdown fails.
+    pub async fn run_with_startup_hook<F, T>(&mut self, startup_hook: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = anyhow::Result<T>>,
+    {
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -876,6 +895,15 @@ impl LiveNode {
                 "Event-store replay loaded; skipping live client connection and reconciliation",
             );
             self.handle.set_state(NodeState::Running);
+            if let Err(startup_error) = startup_hook.await {
+                self.handle.set_state(NodeState::ShuttingDown);
+                if let Err(finalize_error) = self.finalize_stop().await {
+                    anyhow::bail!(
+                        "startup hook failed: {startup_error}; failed to finalize startup abort: {finalize_error}"
+                    );
+                }
+                return Err(startup_error);
+            }
             return Ok(());
         }
 
@@ -1001,6 +1029,21 @@ impl LiveNode {
         }
 
         self.handle.set_state(NodeState::Running);
+
+        let _startup_guard = match startup_hook.await {
+            Ok(guard) => guard,
+            Err(startup_error) => {
+                log::error!("Post-reconciliation startup hook failed: {startup_error}");
+                self.handle.set_state(NodeState::ShuttingDown);
+                self.kernel.stop_trader();
+                if let Err(finalize_error) = self.finalize_stop().await {
+                    anyhow::bail!(
+                        "startup hook failed: {startup_error}; failed to finalize startup abort: {finalize_error}"
+                    );
+                }
+                return Err(startup_error);
+            }
+        };
 
         let exec_config = &self.config.exec_engine;
         let inflight_interval_ns =
@@ -2875,6 +2918,27 @@ mod tests {
         assert!(handle.is_running());
         assert!(node.kernel.is_event_store_replay());
         assert!(node.runner.is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_run_startup_hook_observes_running_node() {
+        let mut node = live_node_with_replay_store(false);
+        let handle = node.handle();
+        let hook_handle = handle.clone();
+        let called = Arc::new(AtomicBool::new(false));
+        let hook_called = Arc::clone(&called);
+
+        node.run_with_startup_hook(async move {
+            assert!(hook_handle.is_running());
+            hook_called.store(true, Ordering::Relaxed);
+            anyhow::Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(called.load(Ordering::Relaxed));
+        assert_eq!(handle.state(), NodeState::Running);
     }
 
     #[rstest]

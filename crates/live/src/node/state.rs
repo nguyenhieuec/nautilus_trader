@@ -129,7 +129,8 @@ pub(super) enum EngineConnectionStatus {
 impl EngineConnectionStatus {
     pub(super) const fn abort_reason(self) -> Option<&'static str> {
         match self {
-            Self::Connected | Self::TimedOut => None,
+            Self::Connected => None,
+            Self::TimedOut => Some("Engine client connection timed out during startup"),
             Self::StopRequested => Some("Stop signal received during startup"),
             Self::ShutdownRequested => Some("Shutdown signal received during startup"),
         }

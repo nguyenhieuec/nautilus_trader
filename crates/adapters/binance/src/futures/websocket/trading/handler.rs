@@ -31,6 +31,9 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nautilus_common::execution_write::{
+    ExecutionWritePayloadViewV1, ExecutionWritePermit, TransportOutcomeClass,
+};
 use nautilus_network::{RECONNECTED, websocket::WebSocketClient};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -50,6 +53,14 @@ use crate::{
     },
 };
 
+fn ws_rejection_outcome(status: u16, code: i32) -> TransportOutcomeClass {
+    if status == 408 || status >= 500 || matches!(code, -1 | -1006 | -1007) {
+        TransportOutcomeClass::OutcomeUnknown
+    } else {
+        TransportOutcomeClass::RejectedDefinitive
+    }
+}
+
 /// Binance Futures WebSocket Trading API handler.
 ///
 /// Runs in a dedicated Tokio task, processing commands from the client
@@ -62,6 +73,7 @@ pub struct BinanceFuturesWsTradingHandler {
     out_tx: tokio::sync::mpsc::UnboundedSender<BinanceFuturesWsTradingMessage>,
     credential: Arc<SigningCredential>,
     pending_requests: AHashMap<String, BinanceFuturesWsTradingRequestMeta>,
+    authorized_permits: AHashMap<String, Box<dyn ExecutionWritePermit>>,
 }
 
 impl Debug for BinanceFuturesWsTradingHandler {
@@ -94,6 +106,7 @@ impl BinanceFuturesWsTradingHandler {
             out_tx,
             credential,
             pending_requests: AHashMap::new(),
+            authorized_permits: AHashMap::new(),
         }
     }
 
@@ -103,6 +116,7 @@ impl BinanceFuturesWsTradingHandler {
     pub async fn run(&mut self) -> bool {
         loop {
             if self.signal.load(Ordering::Relaxed) {
+                self.fail_pending_requests();
                 return false;
             }
 
@@ -117,10 +131,11 @@ impl BinanceFuturesWsTradingHandler {
                         BinanceFuturesWsTradingCommand::Disconnect => {
                             log::debug!("Handler disconnecting WebSocket client");
                             self.inner = None;
+                            self.fail_pending_requests();
                             return false;
                         }
                         BinanceFuturesWsTradingCommand::PlaceOrder { id, params } => {
-                            if let Err(e) = self.handle_place_order(id.clone(), params).await {
+                            if let Err(e) = self.handle_place_order(id.clone(), params, None).await {
                                 log::error!("Failed to handle place order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
@@ -129,9 +144,29 @@ impl BinanceFuturesWsTradingHandler {
                                 });
                             }
                         }
+                        BinanceFuturesWsTradingCommand::AuthorizedPlaceOrder { id, params, permit, final_payload } => {
+                            if let Err(e) = self.handle_place_order(id.clone(), params, Some((permit, final_payload))).await {
+                                log::error!("Failed to handle authorized place order command: {e}");
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
+                                    request_id: id,
+                                    msg: e.to_string(),
+                                });
+                            }
+                        }
                         BinanceFuturesWsTradingCommand::CancelOrder { id, params } => {
-                            if let Err(e) = self.handle_cancel_order(id.clone(), params).await {
+                            if let Err(e) = self.handle_cancel_order(id.clone(), params, None).await {
                                 log::error!("Failed to handle cancel order command: {e}");
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
+                                    request_id: id,
+                                    msg: e.to_string(),
+                                });
+                            }
+                        }
+                        BinanceFuturesWsTradingCommand::AuthorizedCancelOrder { id, params, permit, final_payload } => {
+                            if let Err(e) = self.handle_cancel_order(id.clone(), params, Some((permit, final_payload))).await {
+                                log::error!("Failed to handle authorized cancel order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -164,6 +199,7 @@ impl BinanceFuturesWsTradingHandler {
                     self.handle_message(msg);
                 }
                 else => {
+                    self.fail_pending_requests();
                     return false;
                 }
             }
@@ -186,6 +222,7 @@ impl BinanceFuturesWsTradingHandler {
 
         let pending = std::mem::take(&mut self.pending_requests);
         for (request_id, _meta) in pending {
+            self.record_authorized_outcome(&request_id, TransportOutcomeClass::OutcomeUnknown);
             self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                 request_id,
                 msg: "Connection lost before response received".to_string(),
@@ -197,30 +234,102 @@ impl BinanceFuturesWsTradingHandler {
         &mut self,
         id: String,
         params: BinanceNewOrderParams,
+        mut authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
     ) -> BinanceFuturesWsApiResult<()> {
-        let params_json = serde_json::to_value(&params)
-            .map_err(|e| BinanceFuturesWsApiError::JsonError(e.to_string()))?;
-        let signed_params = self.sign_params(params_json)?;
+        let params_json = match serde_json::to_value(&params) {
+            Ok(value) => value,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(BinanceFuturesWsApiError::JsonError(error.to_string()));
+            }
+        };
+        let signed_params = match self.sign_params(params_json) {
+            Ok(params) => params,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(error);
+            }
+        };
 
         let request = BinanceFuturesWsTradingRequest::new(&id, method::ORDER_PLACE, signed_params);
         self.pending_requests
             .insert(id.clone(), BinanceFuturesWsTradingRequestMeta::PlaceOrder);
-        self.send_request(request).await
+        self.arm_authorized(&id, authorization)?;
+        let result = self.send_request(request).await;
+        if result.is_err() {
+            self.pending_requests.remove(&id);
+            self.record_authorized_outcome(&id, TransportOutcomeClass::OutcomeUnknown);
+        }
+        result
     }
 
     async fn handle_cancel_order(
         &mut self,
         id: String,
         params: BinanceCancelOrderParams,
+        mut authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
     ) -> BinanceFuturesWsApiResult<()> {
-        let params_json = serde_json::to_value(&params)
-            .map_err(|e| BinanceFuturesWsApiError::JsonError(e.to_string()))?;
-        let signed_params = self.sign_params(params_json)?;
+        let params_json = match serde_json::to_value(&params) {
+            Ok(value) => value,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(BinanceFuturesWsApiError::JsonError(error.to_string()));
+            }
+        };
+        let signed_params = match self.sign_params(params_json) {
+            Ok(params) => params,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(error);
+            }
+        };
 
         let request = BinanceFuturesWsTradingRequest::new(&id, method::ORDER_CANCEL, signed_params);
         self.pending_requests
             .insert(id.clone(), BinanceFuturesWsTradingRequestMeta::CancelOrder);
-        self.send_request(request).await
+        self.arm_authorized(&id, authorization)?;
+        let result = self.send_request(request).await;
+        if result.is_err() {
+            self.pending_requests.remove(&id);
+            self.record_authorized_outcome(&id, TransportOutcomeClass::OutcomeUnknown);
+        }
+        result
+    }
+
+    fn arm_authorized(
+        &mut self,
+        id: &str,
+        authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
+    ) -> BinanceFuturesWsApiResult<()> {
+        let Some((permit, final_payload)) = authorization else {
+            return Ok(());
+        };
+        self.authorized_permits.insert(id.to_string(), permit);
+        let arm_result = self
+            .authorized_permits
+            .get_mut(id)
+            .expect("authorized permit was just inserted")
+            .arm_before_transport(&final_payload);
+        if let Err(error) = arm_result {
+            self.pending_requests.remove(id);
+            self.record_authorized_outcome(id, TransportOutcomeClass::RejectedDefinitive);
+            return Err(BinanceFuturesWsApiError::ClientError(error.to_string()));
+        }
+        Ok(())
+    }
+
+    fn record_authorized_outcome(&mut self, id: &str, outcome: TransportOutcomeClass) {
+        if let Some(mut permit) = self.authorized_permits.remove(id) {
+            permit.record_outcome(outcome);
+        }
+    }
+
+    fn record_unarmed_rejection(
+        authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
+    ) {
+        if let Some((mut permit, _final_payload)) = authorization {
+            permit.record_outcome(TransportOutcomeClass::RejectedDefinitive);
+        }
     }
 
     async fn handle_modify_order(
@@ -302,6 +411,7 @@ impl BinanceFuturesWsTradingHandler {
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(frame) => {
                 log::debug!("WebSocket closed: {frame:?}");
+                self.fail_pending_requests();
             }
             Message::Binary(_) | Message::Frame(_) => {}
         }
@@ -311,6 +421,15 @@ impl BinanceFuturesWsTradingHandler {
         let response: BinanceFuturesWsTradingResponse = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(request_id) = value.get("id").and_then(serde_json::Value::as_str)
+                {
+                    self.pending_requests.remove(request_id);
+                    self.record_authorized_outcome(
+                        request_id,
+                        TransportOutcomeClass::OutcomeUnknown,
+                    );
+                }
                 log::warn!("Failed to parse WS Trading API response: {e}");
                 return;
             }
@@ -326,12 +445,17 @@ impl BinanceFuturesWsTradingHandler {
                 -1,
                 format!("Request failed with status {}", response.status),
             ));
+            self.record_authorized_outcome(
+                &response.id,
+                ws_rejection_outcome(response.status, code),
+            );
             let rejection = self.create_rejection(response.id, code, msg, meta);
             self.emit(rejection);
             return;
         }
 
         let Some(result) = response.result else {
+            self.record_authorized_outcome(&response.id, TransportOutcomeClass::OutcomeUnknown);
             log::warn!(
                 "Missing result in success response for request {}",
                 response.id
@@ -339,7 +463,8 @@ impl BinanceFuturesWsTradingHandler {
             return;
         };
 
-        match meta {
+        let outcome_id = response.id.clone();
+        let decoded = match meta {
             BinanceFuturesWsTradingRequestMeta::PlaceOrder => {
                 match serde_json::from_value(result) {
                     Ok(order) => {
@@ -347,10 +472,12 @@ impl BinanceFuturesWsTradingHandler {
                             request_id: response.id,
                             response: Box::new(order),
                         });
+                        true
                     }
                     Err(e) => {
                         log::error!("Failed to deserialize order response: {e}");
                         self.emit(BinanceFuturesWsTradingMessage::Error(e.to_string()));
+                        false
                     }
                 }
             }
@@ -361,10 +488,12 @@ impl BinanceFuturesWsTradingHandler {
                         request_id: response.id,
                         response: Box::new(order),
                     });
+                    true
                 }
                 Err(e) => {
                     log::error!("Failed to deserialize cancel response: {e}");
                     self.emit(BinanceFuturesWsTradingMessage::Error(e.to_string()));
+                    false
                 }
             },
             BinanceFuturesWsTradingRequestMeta::ModifyOrder => match serde_json::from_value(result)
@@ -374,13 +503,23 @@ impl BinanceFuturesWsTradingHandler {
                         request_id: response.id,
                         response: Box::new(order),
                     });
+                    true
                 }
                 Err(e) => {
                     log::error!("Failed to deserialize modify response: {e}");
                     self.emit(BinanceFuturesWsTradingMessage::Error(e.to_string()));
+                    false
                 }
             },
-        }
+        };
+        self.record_authorized_outcome(
+            &outcome_id,
+            if decoded {
+                TransportOutcomeClass::AcceptedNonterminal
+            } else {
+                TransportOutcomeClass::OutcomeUnknown
+            },
+        );
     }
 
     fn create_rejection(
@@ -413,5 +552,26 @@ impl BinanceFuturesWsTradingHandler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(400, -1102, TransportOutcomeClass::RejectedDefinitive)]
+    #[case(408, -1007, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(500, -1102, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(400, -1, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(400, -1006, TransportOutcomeClass::OutcomeUnknown)]
+    fn test_ws_rejection_outcome(
+        #[case] status: u16,
+        #[case] code: i32,
+        #[case] expected: TransportOutcomeClass,
+    ) {
+        assert_eq!(ws_rejection_outcome(status, code), expected);
     }
 }

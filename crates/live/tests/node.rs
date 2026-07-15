@@ -232,6 +232,7 @@ mod serial_tests {
 
     struct BlockingReportExecutionClient {
         connected: Cell<bool>,
+        connect_on_request: bool,
         query_order_received: Arc<AtomicBool>,
         blocking_order_report_requested: Arc<AtomicBool>,
         position_report_requested: Arc<AtomicBool>,
@@ -249,6 +250,7 @@ mod serial_tests {
         ) -> Self {
             Self {
                 connected: Cell::new(false),
+                connect_on_request: true,
                 query_order_received,
                 blocking_order_report_requested,
                 position_report_requested,
@@ -274,6 +276,7 @@ mod serial_tests {
         position_report_requested: Arc<AtomicBool>,
         instrument_received: Arc<AtomicBool>,
         report_release: Option<Arc<tokio::sync::Notify>>,
+        connect_on_request: bool,
     }
 
     impl BlockingReportExecutionClientFactory {
@@ -290,7 +293,13 @@ mod serial_tests {
                 position_report_requested,
                 instrument_received,
                 report_release,
+                connect_on_request: true,
             }
+        }
+
+        fn never_connecting(mut self) -> Self {
+            self.connect_on_request = false;
+            self
         }
     }
 
@@ -301,13 +310,15 @@ mod serial_tests {
             _config: &dyn ClientConfig,
             _cache: CacheView,
         ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-            Ok(Box::new(BlockingReportExecutionClient::new(
+            let mut client = BlockingReportExecutionClient::new(
                 self.query_order_received.clone(),
                 self.blocking_order_report_requested.clone(),
                 self.position_report_requested.clone(),
                 self.instrument_received.clone(),
                 self.report_release.clone(),
-            )))
+            );
+            client.connect_on_request = self.connect_on_request;
+            Ok(Box::new(client))
         }
 
         fn name(&self) -> &'static str {
@@ -341,6 +352,29 @@ mod serial_tests {
             .with_name(name)
             .add_exec_client(
                 Some("blocking-report".to_string()),
+                Box::new(factory),
+                Box::new(BlockingReportExecutionClientConfig),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn live_node_with_never_connecting_exec_client(config: LiveNodeConfig) -> LiveNode {
+        let factory = BlockingReportExecutionClientFactory::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .never_connecting();
+
+        LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("NeverConnectingNode")
+            .add_exec_client(
+                Some("never-connecting".to_string()),
                 Box::new(factory),
                 Box::new(BlockingReportExecutionClientConfig),
             )
@@ -403,7 +437,9 @@ mod serial_tests {
         }
 
         async fn connect(&mut self) -> anyhow::Result<()> {
-            self.connected.set(true);
+            if self.connect_on_request {
+                self.connected.set(true);
+            }
             Ok(())
         }
 
@@ -450,6 +486,42 @@ mod serial_tests {
         assert_eq!(node.state(), NodeState::Idle);
         assert_eq!(node.environment(), Environment::Live);
         assert!(!node.is_running());
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_connection_timeout_never_polls_startup_hook() {
+        let config = LiveNodeConfig {
+            environment: Environment::Sandbox,
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: false,
+                load_cache: false,
+                allow_overfills: true,
+                ..Default::default()
+            },
+            timeout_connection: Duration::from_millis(10),
+            timeout_disconnection: Duration::from_millis(10),
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut node = live_node_with_never_connecting_exec_client(config);
+        let handle = node.handle();
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&hook_called);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            node.run_with_startup_hook(async move {
+                called.store(true, Ordering::Relaxed);
+                anyhow::Ok(())
+            }),
+        )
+        .await
+        .expect("connection timeout path should terminate")
+        .expect("connection timeout should shut down cleanly");
+
+        assert!(!hook_called.load(Ordering::Relaxed));
+        assert_eq!(handle.state(), NodeState::Stopped);
     }
 
     #[rstest]

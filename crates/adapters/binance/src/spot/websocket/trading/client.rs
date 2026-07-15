@@ -33,6 +33,9 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use nautilus_common::execution_write::{
+    ExecutionWritePayloadViewV1, ExecutionWritePermit, TransportOutcomeClass,
+};
 use nautilus_common::live::get_runtime;
 use nautilus_core::string::secret::REDACTED;
 use nautilus_network::{
@@ -345,6 +348,27 @@ impl BinanceSpotWsTradingClient {
         self.send_cmd(cmd).await
     }
 
+    /// Enqueues one writer-authorized order while transferring its permit to the I/O handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and records a definitive local rejection if the handler is unavailable.
+    pub async fn place_order_authorized_with_id(
+        &self,
+        id: String,
+        params: NewOrderParams,
+        permit: Box<dyn ExecutionWritePermit>,
+        final_payload: ExecutionWritePayloadViewV1,
+    ) -> BinanceWsApiResult<()> {
+        self.send_authorized_cmd(BinanceSpotWsTradingCommand::AuthorizedPlaceOrder {
+            id,
+            params,
+            permit,
+            final_payload,
+        })
+        .await
+    }
+
     /// Cancels an order via WebSocket API.
     ///
     /// # Errors
@@ -368,6 +392,27 @@ impl BinanceSpotWsTradingClient {
     ) -> BinanceWsApiResult<()> {
         let cmd = BinanceSpotWsTradingCommand::CancelOrder { id, params };
         self.send_cmd(cmd).await
+    }
+
+    /// Enqueues one writer-authorized cancel while transferring its permit to the I/O handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and records a definitive local rejection if the handler is unavailable.
+    pub async fn cancel_order_authorized_with_id(
+        &self,
+        id: String,
+        params: CancelOrderParams,
+        permit: Box<dyn ExecutionWritePermit>,
+        final_payload: ExecutionWritePayloadViewV1,
+    ) -> BinanceWsApiResult<()> {
+        self.send_authorized_cmd(BinanceSpotWsTradingCommand::AuthorizedCancelOrder {
+            id,
+            params,
+            permit,
+            final_payload,
+        })
+        .await
     }
 
     /// Cancels and replaces an order atomically via WebSocket API.
@@ -465,5 +510,23 @@ impl BinanceSpotWsTradingClient {
             .await
             .send(cmd)
             .map_err(|e| BinanceWsApiError::HandlerUnavailable(e.to_string()))
+    }
+
+    async fn send_authorized_cmd(
+        &self,
+        cmd: BinanceSpotWsTradingCommand,
+    ) -> BinanceWsApiResult<()> {
+        if let Err(error) = self.cmd_tx.read().await.send(cmd) {
+            let message = error.to_string();
+            match error.0 {
+                BinanceSpotWsTradingCommand::AuthorizedPlaceOrder { mut permit, .. }
+                | BinanceSpotWsTradingCommand::AuthorizedCancelOrder { mut permit, .. } => {
+                    permit.record_outcome(TransportOutcomeClass::RejectedDefinitive);
+                }
+                _ => unreachable!("authorized sender received a non-authorized command"),
+            }
+            return Err(BinanceWsApiError::HandlerUnavailable(message));
+        }
+        Ok(())
     }
 }

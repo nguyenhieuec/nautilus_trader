@@ -35,6 +35,9 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nautilus_common::execution_write::{
+    ExecutionWritePayloadViewV1, ExecutionWritePermit, TransportOutcomeClass,
+};
 use nautilus_network::{RECONNECTED, websocket::WebSocketClient};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -60,6 +63,14 @@ use crate::{
     },
 };
 
+fn ws_rejection_outcome(status: u16, code: i32) -> TransportOutcomeClass {
+    if status == 408 || status >= 500 || matches!(code, -1 | -1006 | -1007) {
+        TransportOutcomeClass::OutcomeUnknown
+    } else {
+        TransportOutcomeClass::RejectedDefinitive
+    }
+}
+
 /// Binance Spot WebSocket API handler.
 ///
 /// Runs in a dedicated Tokio task, processing commands from the client
@@ -73,6 +84,7 @@ pub struct BinanceSpotWsTradingHandler {
     out_tx: tokio::sync::mpsc::UnboundedSender<BinanceSpotWsTradingMessage>,
     credential: Arc<SigningCredential>,
     pending_requests: AHashMap<String, BinanceSpotWsTradingRequestMeta>,
+    authorized_permits: AHashMap<String, Box<dyn ExecutionWritePermit>>,
     request_id_counter: AtomicU64,
 }
 
@@ -106,6 +118,7 @@ impl BinanceSpotWsTradingHandler {
             out_tx,
             credential,
             pending_requests: AHashMap::new(),
+            authorized_permits: AHashMap::new(),
             request_id_counter: AtomicU64::new(1000),
         }
     }
@@ -117,6 +130,7 @@ impl BinanceSpotWsTradingHandler {
     pub async fn run(&mut self) -> bool {
         loop {
             if self.signal.load(Ordering::Relaxed) {
+                self.fail_pending_requests();
                 return false;
             }
 
@@ -131,10 +145,11 @@ impl BinanceSpotWsTradingHandler {
                         BinanceSpotWsTradingCommand::Disconnect => {
                             log::debug!("Handler disconnecting WebSocket client");
                             self.inner = None;
+                            self.fail_pending_requests();
                             return false;
                         }
                         BinanceSpotWsTradingCommand::PlaceOrder { id, params } => {
-                            if let Err(e) = self.handle_place_order(id.clone(), params).await {
+                            if let Err(e) = self.handle_place_order(id.clone(), params, None).await {
                                 log::error!("Failed to handle place order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
@@ -143,9 +158,29 @@ impl BinanceSpotWsTradingHandler {
                                 });
                             }
                         }
+                        BinanceSpotWsTradingCommand::AuthorizedPlaceOrder { id, params, permit, final_payload } => {
+                            if let Err(e) = self.handle_place_order(id.clone(), params, Some((permit, final_payload))).await {
+                                log::error!("Failed to handle authorized place order command: {e}");
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceSpotWsTradingMessage::RequestFailed {
+                                    request_id: id,
+                                    msg: e.to_string(),
+                                });
+                            }
+                        }
                         BinanceSpotWsTradingCommand::CancelOrder { id, params } => {
-                            if let Err(e) = self.handle_cancel_order(id.clone(), params).await {
+                            if let Err(e) = self.handle_cancel_order(id.clone(), params, None).await {
                                 log::error!("Failed to handle cancel order command: {e}");
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceSpotWsTradingMessage::RequestFailed {
+                                    request_id: id,
+                                    msg: e.to_string(),
+                                });
+                            }
+                        }
+                        BinanceSpotWsTradingCommand::AuthorizedCancelOrder { id, params, permit, final_payload } => {
+                            if let Err(e) = self.handle_cancel_order(id.clone(), params, Some((permit, final_payload))).await {
+                                log::error!("Failed to handle authorized cancel order command: {e}");
                                 self.pending_requests.remove(&id);
                                 self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                                     request_id: id,
@@ -208,6 +243,7 @@ impl BinanceSpotWsTradingHandler {
                 }
                 else => {
                     // Both channels closed
+                    self.fail_pending_requests();
                     return false;
                 }
             }
@@ -232,6 +268,7 @@ impl BinanceSpotWsTradingHandler {
 
         let pending = std::mem::take(&mut self.pending_requests);
         for (request_id, _meta) in pending {
+            self.record_authorized_outcome(&request_id, TransportOutcomeClass::OutcomeUnknown);
             self.emit(BinanceSpotWsTradingMessage::RequestFailed {
                 request_id,
                 msg: "Connection lost before response received".to_string(),
@@ -243,30 +280,102 @@ impl BinanceSpotWsTradingHandler {
         &mut self,
         id: String,
         params: crate::spot::http::query::NewOrderParams,
+        mut authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
     ) -> BinanceWsApiResult<()> {
-        let params_json = serde_json::to_value(&params)
-            .map_err(|e| BinanceWsApiError::ClientError(e.to_string()))?;
-        let signed_params = self.sign_params(params_json)?;
+        let params_json = match serde_json::to_value(&params) {
+            Ok(value) => value,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(BinanceWsApiError::ClientError(error.to_string()));
+            }
+        };
+        let signed_params = match self.sign_params(params_json) {
+            Ok(params) => params,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(error);
+            }
+        };
 
         let request = BinanceSpotWsTradingRequest::new(&id, method::ORDER_PLACE, signed_params);
         self.pending_requests
             .insert(id.clone(), BinanceSpotWsTradingRequestMeta::PlaceOrder);
-        self.send_request(request).await
+        self.arm_authorized(&id, authorization)?;
+        let result = self.send_request(request).await;
+        if result.is_err() {
+            self.pending_requests.remove(&id);
+            self.record_authorized_outcome(&id, TransportOutcomeClass::OutcomeUnknown);
+        }
+        result
     }
 
     async fn handle_cancel_order(
         &mut self,
         id: String,
         params: crate::spot::http::query::CancelOrderParams,
+        mut authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
     ) -> BinanceWsApiResult<()> {
-        let params_json = serde_json::to_value(&params)
-            .map_err(|e| BinanceWsApiError::ClientError(e.to_string()))?;
-        let signed_params = self.sign_params(params_json)?;
+        let params_json = match serde_json::to_value(&params) {
+            Ok(value) => value,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(BinanceWsApiError::ClientError(error.to_string()));
+            }
+        };
+        let signed_params = match self.sign_params(params_json) {
+            Ok(params) => params,
+            Err(error) => {
+                Self::record_unarmed_rejection(authorization.take());
+                return Err(error);
+            }
+        };
 
         let request = BinanceSpotWsTradingRequest::new(&id, method::ORDER_CANCEL, signed_params);
         self.pending_requests
             .insert(id.clone(), BinanceSpotWsTradingRequestMeta::CancelOrder);
-        self.send_request(request).await
+        self.arm_authorized(&id, authorization)?;
+        let result = self.send_request(request).await;
+        if result.is_err() {
+            self.pending_requests.remove(&id);
+            self.record_authorized_outcome(&id, TransportOutcomeClass::OutcomeUnknown);
+        }
+        result
+    }
+
+    fn arm_authorized(
+        &mut self,
+        id: &str,
+        authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
+    ) -> BinanceWsApiResult<()> {
+        let Some((permit, final_payload)) = authorization else {
+            return Ok(());
+        };
+        self.authorized_permits.insert(id.to_string(), permit);
+        let arm_result = self
+            .authorized_permits
+            .get_mut(id)
+            .expect("authorized permit was just inserted")
+            .arm_before_transport(&final_payload);
+        if let Err(error) = arm_result {
+            self.pending_requests.remove(id);
+            self.record_authorized_outcome(id, TransportOutcomeClass::RejectedDefinitive);
+            return Err(BinanceWsApiError::ClientError(error.to_string()));
+        }
+        Ok(())
+    }
+
+    fn record_authorized_outcome(&mut self, id: &str, outcome: TransportOutcomeClass) {
+        if let Some(mut permit) = self.authorized_permits.remove(id) {
+            permit.record_outcome(outcome);
+        }
+    }
+
+    fn record_unarmed_rejection(
+        authorization: Option<(Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1)>,
+    ) {
+        if let Some((mut permit, _final_payload)) = authorization {
+            permit.record_outcome(TransportOutcomeClass::RejectedDefinitive);
+        }
     }
 
     async fn handle_cancel_replace_order(
@@ -390,6 +499,7 @@ impl BinanceSpotWsTradingHandler {
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(frame) => {
                 log::debug!("WebSocket closed: {frame:?}");
+                self.fail_pending_requests();
             }
             Message::Frame(_) => {}
         }
@@ -620,11 +730,13 @@ impl BinanceSpotWsTradingHandler {
                 status as i32,
                 format!("Request failed with status {status}"),
             ));
+            self.record_authorized_outcome(&request_id, ws_rejection_outcome(status, code));
             return Ok(self.create_rejection(request_id, code, msg, meta));
         }
 
         // Decode the inner payload based on request type
-        match meta {
+        let outcome_id = request_id.clone();
+        let decoded = (|| match meta {
             BinanceSpotWsTradingRequestMeta::PlaceOrder => {
                 let response = parse::decode_new_order_full(&result_data)?;
                 Ok(BinanceSpotWsTradingMessage::OrderAccepted {
@@ -684,7 +796,16 @@ impl BinanceSpotWsTradingHandler {
                     subscription_id: request_id,
                 })
             }
-        }
+        })();
+        self.record_authorized_outcome(
+            &outcome_id,
+            if decoded.is_ok() {
+                TransportOutcomeClass::AcceptedNonterminal
+            } else {
+                TransportOutcomeClass::OutcomeUnknown
+            },
+        );
+        decoded
     }
 
     /// Parses the WebSocketResponse SBE envelope.
@@ -908,9 +1029,176 @@ pub(crate) fn parse_server_shutdown_event_time_ms(data: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use nautilus_common::execution_write::{
+        ExecutionAuthorityProof, ExecutionProduct, ExecutionRoute, ExecutionTransportTargetViewV1,
+        ExecutionWriteElementViewV1, ExecutionWriteGateError, ExecutionWriteIdentity,
+        ExecutionWriteKind, FinalWritePayloadDigest, WriteContextDigest,
+    };
+    use nautilus_core::UUID4;
+    use nautilus_model::identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId};
     use rstest::rstest;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct RecordingPermit {
+        identity: ExecutionWriteIdentity,
+        authority: ExecutionAuthorityProof,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        reject_arm: bool,
+    }
+
+    impl ExecutionWritePermit for RecordingPermit {
+        fn identity(&self) -> &ExecutionWriteIdentity {
+            &self.identity
+        }
+
+        fn authority(&self) -> &ExecutionAuthorityProof {
+            &self.authority
+        }
+
+        fn arm_before_transport(
+            &mut self,
+            _final_payload: &ExecutionWritePayloadViewV1,
+        ) -> Result<(), ExecutionWriteGateError> {
+            self.events.lock().unwrap().push("arm");
+            if self.reject_arm {
+                Err(ExecutionWriteGateError::ArmRejected(
+                    "test rejection".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record_outcome(&mut self, outcome: TransportOutcomeClass) {
+            let event = match outcome {
+                TransportOutcomeClass::AcceptedNonterminal => "accepted",
+                TransportOutcomeClass::RejectedDefinitive => "rejected",
+                TransportOutcomeClass::OutcomeUnknown => "unknown",
+            };
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn cancel_authorization(
+        events: Arc<Mutex<Vec<&'static str>>>,
+        reject_arm: bool,
+    ) -> (Box<dyn ExecutionWritePermit>, ExecutionWritePayloadViewV1) {
+        let client_id = ClientId::from("BINANCE-SPOT");
+        let account_id = AccountId::from("BINANCE-SPOT-001");
+        let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let client_order_id = ClientOrderId::from("SAE-SPOT-1");
+        let permit = RecordingPermit {
+            identity: ExecutionWriteIdentity {
+                context_digest: WriteContextDigest([1; 32]),
+                command_id: UUID4::new(),
+                client_id,
+                account_id,
+                route: ExecutionRoute::BinanceSpot,
+                instrument_id: Some(instrument_id),
+                client_order_ids: vec![client_order_id],
+                kind: ExecutionWriteKind::Cancel,
+                final_payload_digest: FinalWritePayloadDigest([2; 32]),
+            },
+            authority: ExecutionAuthorityProof {
+                authority_digest: [3; 32],
+                instance_digest: [4; 32],
+                generation: 1,
+            },
+            events,
+            reject_arm,
+        };
+        let payload = ExecutionWritePayloadViewV1 {
+            schema_version: 1,
+            kind: ExecutionWriteKind::Cancel,
+            client_id,
+            account_id,
+            product: ExecutionProduct::Spot,
+            route: ExecutionRoute::BinanceSpot,
+            transport: ExecutionTransportTargetViewV1::WebSocketApi {
+                method: "order.cancel".to_string(),
+                recv_window_ms: 5_000,
+            },
+            elements: vec![ExecutionWriteElementViewV1::Cancel {
+                batch_index: 0,
+                instrument_id,
+                client_order_id,
+                venue_order_id: None,
+                cancel_request_client_order_id: None,
+            }],
+            retry_of: None,
+        };
+        (Box::new(permit), payload)
+    }
+
+    fn handler() -> BinanceSpotWsTradingHandler {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        BinanceSpotWsTradingHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            Arc::new(SigningCredential::new(
+                "test-api-key".to_string(),
+                "test-api-secret".to_string(),
+            )),
+        )
+    }
+
+    #[rstest]
+    #[case(400, -1102, TransportOutcomeClass::RejectedDefinitive)]
+    #[case(408, -1007, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(500, -1102, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(400, -1, TransportOutcomeClass::OutcomeUnknown)]
+    #[case(400, -1006, TransportOutcomeClass::OutcomeUnknown)]
+    fn test_ws_rejection_outcome(
+        #[case] status: u16,
+        #[case] code: i32,
+        #[case] expected: TransportOutcomeClass,
+    ) {
+        assert_eq!(ws_rejection_outcome(status, code), expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authorized_send_failure_arms_at_transport_then_records_unknown() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = handler();
+        let result = handler
+            .handle_cancel_order(
+                "authorized-cancel".to_string(),
+                crate::spot::http::query::CancelOrderParams::by_order_id("BTCUSDT", 42),
+                Some(cancel_authorization(Arc::clone(&events), false)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(*events.lock().unwrap(), ["arm", "unknown"]);
+        assert!(handler.pending_requests.is_empty());
+        assert!(handler.authorized_permits.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn arm_rejection_never_reaches_transport_and_records_definitive_rejection() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = handler();
+        let result = handler
+            .handle_cancel_order(
+                "rejected-cancel".to_string(),
+                crate::spot::http::query::CancelOrderParams::by_order_id("BTCUSDT", 42),
+                Some(cancel_authorization(Arc::clone(&events), true)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(*events.lock().unwrap(), ["arm", "rejected"]);
+        assert!(handler.pending_requests.is_empty());
+        assert!(handler.authorized_permits.is_empty());
+    }
 
     #[rstest]
     #[case::microseconds_converted_to_ms(1_700_000_000_000_000_i64, 1_700_000_000_000_i64)]

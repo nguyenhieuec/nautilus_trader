@@ -90,7 +90,7 @@ pub enum ExecutionTransportTargetViewV1 {
         /// Reviewed receive window in milliseconds.
         recv_window_ms: u64,
     },
-    /// Replayable WebSocket order transport, represented only so the boundary can reject it.
+    /// Authenticated WebSocket API order transport.
     WebSocketApi {
         /// Exact WebSocket API method.
         method: String,
@@ -343,34 +343,46 @@ impl ExecutionWritePayloadViewV1 {
     }
 
     fn validate_transport(&self) -> Result<(), ExecutionWriteGateError> {
-        let ExecutionTransportTargetViewV1::Http {
-            method,
-            path,
-            recv_window_ms,
-        } = &self.transport
-        else {
-            return Err(ExecutionWriteGateError::InvalidContext(
-                "WebSocket order transport is forbidden".to_string(),
-            ));
+        let (method_matches, route_matches, recv_window_ms) = match &self.transport {
+            ExecutionTransportTargetViewV1::Http {
+                method,
+                path,
+                recv_window_ms,
+            } => {
+                let method_matches = matches!(
+                    (self.kind, *method),
+                    (
+                        ExecutionWriteKind::Submit | ExecutionWriteKind::Retry,
+                        ExecutionHttpMethod::Post
+                    ) | (ExecutionWriteKind::Cancel, ExecutionHttpMethod::Delete)
+                );
+                let route_matches = matches!(
+                    (self.route, *path),
+                    (
+                        ExecutionRoute::BinanceSpot,
+                        ExecutionEndpointPath::SpotOrder
+                    ) | (
+                        ExecutionRoute::BinanceFutures,
+                        ExecutionEndpointPath::FuturesOrder
+                    )
+                );
+                (method_matches, route_matches, recv_window_ms)
+            }
+            ExecutionTransportTargetViewV1::WebSocketApi {
+                method,
+                recv_window_ms,
+            } => {
+                let method_matches = matches!(
+                    (self.kind, method.as_str()),
+                    (
+                        ExecutionWriteKind::Submit | ExecutionWriteKind::Retry,
+                        "order.place"
+                    ) | (ExecutionWriteKind::Cancel, "order.cancel")
+                );
+                (method_matches, true, recv_window_ms)
+            }
         };
-        let method_matches = matches!(
-            (self.kind, *method),
-            (
-                ExecutionWriteKind::Submit | ExecutionWriteKind::Retry,
-                ExecutionHttpMethod::Post
-            ) | (ExecutionWriteKind::Cancel, ExecutionHttpMethod::Delete)
-        );
-        let path_matches = matches!(
-            (self.route, *path),
-            (
-                ExecutionRoute::BinanceSpot,
-                ExecutionEndpointPath::SpotOrder
-            ) | (
-                ExecutionRoute::BinanceFutures,
-                ExecutionEndpointPath::FuturesOrder
-            )
-        );
-        if !method_matches || !path_matches || !(1..=60_000).contains(recv_window_ms) {
+        if !method_matches || !route_matches || !(1..=60_000).contains(recv_window_ms) {
             return Err(ExecutionWriteGateError::InvalidContext(
                 "transport target is outside the first-release allowlist".to_string(),
             ));
@@ -760,10 +772,15 @@ mod tests {
     }
 
     #[test]
-    fn websocket_order_transport_is_always_rejected() {
+    fn websocket_order_transport_requires_exact_method_kind_parity() {
         let (context, mut payload) = submit_fixture(ExecutionProduct::Spot);
         payload.transport = ExecutionTransportTargetViewV1::WebSocketApi {
             method: "order.place".to_string(),
+            recv_window_ms: 5_000,
+        };
+        assert_eq!(payload.validate_first_release(&context), Ok(()));
+        payload.transport = ExecutionTransportTargetViewV1::WebSocketApi {
+            method: "order.cancel".to_string(),
             recv_window_ms: 5_000,
         };
         assert!(payload.validate_first_release(&context).is_err());

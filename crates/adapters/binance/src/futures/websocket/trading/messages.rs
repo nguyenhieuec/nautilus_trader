@@ -20,6 +20,7 @@
 //! - [`BinanceFuturesWsTradingMessage`]: Output messages emitted by the handler to the client.
 //! - Request/response structures for the Binance Futures WebSocket Trading API.
 
+use nautilus_common::execution_write::{ExecutionWritePayloadViewV1, ExecutionWritePermit};
 use nautilus_network::websocket::WebSocketClient;
 use serde::{Deserialize, Serialize};
 
@@ -49,12 +50,34 @@ pub enum BinanceFuturesWsTradingCommand {
         /// Order parameters.
         params: BinanceNewOrderParams,
     },
+    /// Places a new order while retaining final writer authority through the venue response.
+    AuthorizedPlaceOrder {
+        /// Request ID for correlation.
+        id: String,
+        /// Order parameters.
+        params: BinanceNewOrderParams,
+        /// Owned final writer permit.
+        permit: Box<dyn ExecutionWritePermit>,
+        /// Exact final transport payload used for last-line arming.
+        final_payload: ExecutionWritePayloadViewV1,
+    },
     /// Cancels an order.
     CancelOrder {
         /// Request ID for correlation.
         id: String,
         /// Cancel parameters.
         params: BinanceCancelOrderParams,
+    },
+    /// Cancels an order while retaining final writer authority through the venue response.
+    AuthorizedCancelOrder {
+        /// Request ID for correlation.
+        id: String,
+        /// Cancel parameters.
+        params: BinanceCancelOrderParams,
+        /// Owned final writer permit.
+        permit: Box<dyn ExecutionWritePermit>,
+        /// Exact final transport payload used for last-line arming.
+        final_payload: ExecutionWritePayloadViewV1,
     },
     /// Modifies an order (in-place price/quantity amendment).
     ModifyOrder {

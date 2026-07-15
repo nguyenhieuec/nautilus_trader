@@ -20,6 +20,7 @@
 //! - [`BinanceSpotWsTradingMessage`]: Output messages emitted by the handler to the client.
 //! - Request/response structures for the Binance Spot WebSocket Trading API.
 
+use nautilus_common::execution_write::{ExecutionWritePayloadViewV1, ExecutionWritePermit};
 use nautilus_network::websocket::WebSocketClient;
 use serde::{Deserialize, Serialize};
 
@@ -52,12 +53,34 @@ pub enum BinanceSpotWsTradingCommand {
         /// Order parameters.
         params: NewOrderParams,
     },
+    /// Places a new order while retaining final writer authority through the venue response.
+    AuthorizedPlaceOrder {
+        /// Request ID for correlation.
+        id: String,
+        /// Order parameters.
+        params: NewOrderParams,
+        /// Owned final writer permit.
+        permit: Box<dyn ExecutionWritePermit>,
+        /// Exact final transport payload used for last-line arming.
+        final_payload: ExecutionWritePayloadViewV1,
+    },
     /// Cancels an order.
     CancelOrder {
         /// Request ID for correlation.
         id: String,
         /// Cancel parameters.
         params: CancelOrderParams,
+    },
+    /// Cancels an order while retaining final writer authority through the venue response.
+    AuthorizedCancelOrder {
+        /// Request ID for correlation.
+        id: String,
+        /// Cancel parameters.
+        params: CancelOrderParams,
+        /// Owned final writer permit.
+        permit: Box<dyn ExecutionWritePermit>,
+        /// Exact final transport payload used for last-line arming.
+        final_payload: ExecutionWritePayloadViewV1,
     },
     /// Cancels and replaces an order atomically.
     CancelReplaceOrder {

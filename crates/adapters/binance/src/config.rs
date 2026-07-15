@@ -218,12 +218,19 @@ impl BinanceExecClientConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when replayable WebSocket order transport is enabled.
+    /// Returns an error unless WebSocket order transport is restricted to the
+    /// live environment and the required private trading session is mandatory.
     pub fn validate_first_release_write_boundary(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.use_ws_order_transport,
-            "first-release Binance order transport must use HTTP"
-        );
+        if self.use_ws_order_transport {
+            anyhow::ensure!(
+                self.environment == BinanceEnvironment::Live,
+                "Binance WebSocket order transport is live-only"
+            );
+            anyhow::ensure!(
+                self.use_ws_trading && self.require_ws_trading,
+                "Binance WebSocket order transport requires a mandatory private trading session"
+            );
+        }
         Ok(())
     }
 }
@@ -298,13 +305,33 @@ product_types = ["SPOT", "USD_M"]
     }
 
     #[rstest]
-    fn test_first_release_rejects_ws_order_transport_without_disabling_private_ws() {
-        let config = BinanceExecClientConfig::builder()
+    fn test_first_release_ws_order_transport_is_live_and_session_mandatory() {
+        let testnet = BinanceExecClientConfig::builder()
+            .environment(BinanceEnvironment::Testnet)
             .use_ws_trading(true)
             .use_ws_order_transport(true)
+            .require_ws_trading(true)
             .build();
+        assert!(testnet.validate_first_release_write_boundary().is_err());
 
-        assert!(config.validate_first_release_write_boundary().is_err());
-        assert!(config.use_ws_trading);
+        let optional_session = BinanceExecClientConfig::builder()
+            .environment(BinanceEnvironment::Live)
+            .use_ws_trading(true)
+            .use_ws_order_transport(true)
+            .require_ws_trading(false)
+            .build();
+        assert!(
+            optional_session
+                .validate_first_release_write_boundary()
+                .is_err()
+        );
+
+        let live = BinanceExecClientConfig::builder()
+            .environment(BinanceEnvironment::Live)
+            .use_ws_trading(true)
+            .use_ws_order_transport(true)
+            .require_ws_trading(true)
+            .build();
+        assert!(live.validate_first_release_write_boundary().is_ok());
     }
 }
