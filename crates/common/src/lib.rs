@@ -126,6 +126,7 @@ pub mod config;
 pub mod custom;
 pub mod enums;
 pub mod execution_persistence;
+pub mod execution_write;
 pub mod factories;
 pub mod generators;
 pub mod greeks;

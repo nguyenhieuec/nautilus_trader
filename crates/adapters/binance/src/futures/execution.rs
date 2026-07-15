@@ -31,17 +31,24 @@ use dashmap::DashMap;
 use nautilus_common::{
     cache::fifo::FifoCache,
     clients::ExecutionClient,
+    execution_write::{
+        ExecutionEndpointPath, ExecutionHttpMethod, ExecutionOrderResponseMode, ExecutionProduct,
+        ExecutionRoute, ExecutionTimeInForce, ExecutionTransportTargetViewV1,
+        ExecutionWriteContext, ExecutionWriteElementViewV1, ExecutionWriteGateError,
+        ExecutionWriteGateHandle, ExecutionWriteKind, ExecutionWritePayloadViewV1,
+        FinalWritePayloadDigest, TransportOutcomeClass,
+    },
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, CorrelatedTruthReporter,
-        GenerateBinanceTruthReport, GenerateFillReports, GenerateOrderStatusReport,
-        GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+        CorrelatedTruthReporter, GenerateBinanceTruthReport, GenerateFillReports,
+        GenerateOrderStatusReport, GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder, ModifyOrder,
         QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TruthReportError,
     },
 };
 use nautilus_core::{
-    AtomicSet, MUTEX_POISONED, UUID4, UnixNanos,
+    AtomicSet, MUTEX_POISONED, Params, UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -126,6 +133,30 @@ use crate::{
         },
     },
 };
+
+const RETRY_OF_PARAM: &str = "sae_retry_of";
+
+fn retry_digest(params: Option<&Params>) -> anyhow::Result<Option<FinalWritePayloadDigest>> {
+    let Some(value) = params.and_then(|params| params.get_str(RETRY_OF_PARAM)) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        value.len() == 64 && value.is_ascii(),
+        "sae_retry_of must be 64 lowercase hex characters"
+    );
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let offset = index * 2;
+        let pair = &value[offset..offset + 2];
+        anyhow::ensure!(
+            pair.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "sae_retry_of must be 64 lowercase hex characters"
+        );
+        *byte = u8::from_str_radix(pair, 16)?;
+    }
+    Ok(Some(FinalWritePayloadDigest(digest)))
+}
 
 #[derive(Clone, Debug)]
 struct BinanceFuturesTruthReporter {
@@ -333,6 +364,7 @@ pub struct BinanceFuturesExecutionClient {
     recovery_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     private_stream_health: PrivateStreamHealthHandle,
     truth_reporter: Arc<BinanceFuturesTruthReporter>,
+    write_gate: Option<ExecutionWriteGateHandle>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
     is_hedge_mode: AtomicBool,
 }
@@ -345,6 +377,28 @@ impl BinanceFuturesExecutionClient {
     /// Returns an error if the HTTP client fails to initialize, credentials are
     /// missing, or the product type is not a futures type (UsdM or CoinM).
     pub fn new(core: ExecutionClientCore, config: BinanceExecClientConfig) -> anyhow::Result<Self> {
+        Self::new_inner(core, config, None)
+    }
+
+    /// Creates a production client with the required final execution-write gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP or WebSocket client fails to initialize or credentials are
+    /// missing.
+    pub fn new_with_write_gate(
+        core: ExecutionClientCore,
+        config: BinanceExecClientConfig,
+        write_gate: ExecutionWriteGateHandle,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(core, config, Some(write_gate))
+    }
+
+    fn new_inner(
+        core: ExecutionClientCore,
+        config: BinanceExecClientConfig,
+        write_gate: Option<ExecutionWriteGateHandle>,
+    ) -> anyhow::Result<Self> {
         let product_type = config.product_type;
         match product_type {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
@@ -371,9 +425,9 @@ impl BinanceFuturesExecutionClient {
             Some(api_key.clone()),
             Some(api_secret.clone()),
             config.base_url_http.clone(),
-            None, // recv_window
-            None, // timeout_secs
-            None, // proxy_url
+            Some(5_000), // reviewed first-release recv_window
+            None,        // timeout_secs
+            None,        // proxy_url
             config.treat_expired_as_canceled,
         )
         .context("failed to construct Binance Futures HTTP client")?;
@@ -444,6 +498,7 @@ impl BinanceFuturesExecutionClient {
             recovery_tx: Mutex::new(None),
             private_stream_health: PrivateStreamHealthHandle::new(client_id),
             truth_reporter,
+            write_gate,
             pending_tasks: Mutex::new(Vec::new()),
             is_hedge_mode: AtomicBool::new(false),
         })
@@ -609,6 +664,33 @@ impl BinanceFuturesExecutionClient {
         let trigger_type = order.trigger_type();
         let position_side = determine_position_side(self.is_hedge_mode(), order_side, reduce_only);
 
+        anyhow::ensure!(
+            !self.is_hedge_mode(),
+            "first-release Binance Futures requires one-way mode"
+        );
+        anyhow::ensure!(
+            matches!(order_type, OrderType::Market | OrderType::Limit),
+            "first-release Binance Futures rejects conditional or algorithm order type {order_type:?}"
+        );
+        anyhow::ensure!(
+            trigger_price.is_none()
+                && activation_price.is_none()
+                && trailing_offset.is_none()
+                && trigger_type.is_none(),
+            "first-release Binance Futures rejects trigger and algorithm controls"
+        );
+        if order_type == OrderType::Limit {
+            anyhow::ensure!(
+                price.is_some(),
+                "Binance Futures limit order requires a price"
+            );
+        } else {
+            anyhow::ensure!(
+                price.is_none(),
+                "Binance Futures market order forbids a price"
+            );
+        }
+
         // Register identity for tracked/external dispatch routing
         self.dispatch_state.order_identities.insert(
             client_order_id,
@@ -629,6 +711,10 @@ impl BinanceFuturesExecutionClient {
             .as_ref()
             .and_then(|p| p.get_bool("close_position"))
             .unwrap_or(false);
+        anyhow::ensure!(
+            !close_position,
+            "first-release Binance Futures rejects close_position"
+        );
 
         let price_match = cmd
             .params
@@ -636,6 +722,10 @@ impl BinanceFuturesExecutionClient {
             .and_then(|p| p.get_str("price_match"))
             .map(BinancePriceMatch::from_param)
             .transpose()?;
+        anyhow::ensure!(
+            price_match.is_none(),
+            "first-release Binance Futures rejects price_match"
+        );
 
         let callback_rate = trailing_offset
             .map(trailing_offset_to_callback_rate_string)
@@ -649,8 +739,67 @@ impl BinanceFuturesExecutionClient {
             _ => None,
         };
 
+        let retry_of = retry_digest(cmd.params.as_ref())?;
+        let write_kind = if retry_of.is_some() {
+            ExecutionWriteKind::Retry
+        } else {
+            ExecutionWriteKind::Submit
+        };
+        let final_time_in_force = final_time_in_force(order_type, time_in_force, post_only)?;
+        let final_payload = ExecutionWritePayloadViewV1 {
+            schema_version: 1,
+            kind: write_kind,
+            client_id: self.core.client_id,
+            account_id,
+            product: ExecutionProduct::Futures,
+            route: ExecutionRoute::BinanceFutures,
+            transport: ExecutionTransportTargetViewV1::Http {
+                method: ExecutionHttpMethod::Post,
+                path: ExecutionEndpointPath::FuturesOrder,
+                recv_window_ms: 5_000,
+            },
+            elements: vec![ExecutionWriteElementViewV1::Submit {
+                batch_index: 0,
+                instrument_id,
+                client_order_id,
+                side: order_side,
+                order_type,
+                time_in_force: final_time_in_force,
+                quantity,
+                price,
+                trigger_price,
+                quote_quantity: None,
+                display_quantity: None,
+                reduce_only,
+                post_only,
+                position_side: None,
+                close_position: None,
+                working_type: None,
+                price_protect: None,
+                response_mode: ExecutionOrderResponseMode::FuturesOmitted,
+                good_till_date_ms: None,
+                self_trade_prevention_mode: None,
+                trailing_delta: None,
+                activation_price: None,
+                callback_rate: None,
+                price_match: None,
+                strategy_id: None,
+                strategy_type: None,
+            }],
+            retry_of,
+        };
+        let write_context = ExecutionWriteContext {
+            command_id: cmd.command_id,
+            client_id: self.core.client_id,
+            account_id,
+            route: ExecutionRoute::BinanceFutures,
+            instrument_id: Some(instrument_id),
+            client_order_ids: vec![client_order_id],
+            kind: write_kind,
+        };
+
         // Non-algo orders can route through WS trading API when active
-        if self.ws_trading_active() && !use_algo_api {
+        if self.config.use_ws_order_transport && self.ws_trading_active() && !use_algo_api {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
 
@@ -729,8 +878,15 @@ impl BinanceFuturesExecutionClient {
         }
 
         let http_client = self.http_client.clone();
+        let write_gate = self.write_gate.clone();
 
         self.spawn_task("submit_order", async move {
+            let write_gate = write_gate.ok_or(ExecutionWriteGateError::MissingGate)?;
+            final_payload.validate_first_release(&write_context)?;
+            let mut permit = write_gate
+                .acquire(&write_context, &final_payload)
+                .await?;
+            permit.arm_before_transport(&final_payload)?;
             let result = if use_algo_api {
                 http_client
                     .submit_algo_order(
@@ -770,6 +926,18 @@ impl BinanceFuturesExecutionClient {
                     )
                     .await
             };
+
+            let outcome = match &result {
+                Ok(_) => TransportOutcomeClass::AcceptedNonterminal,
+                Err(error)
+                    if is_structured_venue_rejection(error)
+                        || is_local_command_failure(error) =>
+                {
+                    TransportOutcomeClass::RejectedDefinitive
+                }
+                Err(_) => TransportOutcomeClass::OutcomeUnknown,
+            };
+            permit.record_outcome(outcome);
 
             match result {
                 Ok(report) => {
@@ -822,7 +990,11 @@ impl BinanceFuturesExecutionClient {
         Ok(())
     }
 
-    fn cancel_order_internal(&self, cmd: &CancelOrder) {
+    fn cancel_order_internal(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cmd.venue_order_id.is_none(),
+            "first-release Binance Futures cancel requires exact ClientOrderId only"
+        );
         let command = cmd.clone();
 
         // Non-triggered algo orders use algo cancel endpoint, triggered use regular
@@ -835,6 +1007,10 @@ impl BinanceFuturesExecutionClient {
             .triggered_algo_order_ids
             .contains(&command.client_order_id);
         let use_algo_cancel = is_algo && !is_triggered;
+        anyhow::ensure!(
+            !use_algo_cancel,
+            "first-release Binance Futures rejects algorithm cancellation"
+        );
 
         let emitter = self.emitter.clone();
         let trader_id = self.core.trader_id;
@@ -843,9 +1019,39 @@ impl BinanceFuturesExecutionClient {
         let instrument_id = command.instrument_id;
         let venue_order_id = command.venue_order_id;
         let client_order_id = command.client_order_id;
+        let final_payload = ExecutionWritePayloadViewV1 {
+            schema_version: 1,
+            kind: ExecutionWriteKind::Cancel,
+            client_id: self.core.client_id,
+            account_id,
+            product: ExecutionProduct::Futures,
+            route: ExecutionRoute::BinanceFutures,
+            transport: ExecutionTransportTargetViewV1::Http {
+                method: ExecutionHttpMethod::Delete,
+                path: ExecutionEndpointPath::FuturesOrder,
+                recv_window_ms: 5_000,
+            },
+            elements: vec![ExecutionWriteElementViewV1::Cancel {
+                batch_index: 0,
+                instrument_id,
+                client_order_id,
+                venue_order_id: None,
+                cancel_request_client_order_id: None,
+            }],
+            retry_of: None,
+        };
+        let write_context = ExecutionWriteContext {
+            command_id: command.command_id,
+            client_id: self.core.client_id,
+            account_id,
+            route: ExecutionRoute::BinanceFutures,
+            instrument_id: Some(instrument_id),
+            client_order_ids: vec![client_order_id],
+            kind: ExecutionWriteKind::Cancel,
+        };
 
         // Non-algo cancels can route through WS trading API when active
-        if self.ws_trading_active() && !use_algo_cancel {
+        if self.config.use_ws_order_transport && self.ws_trading_active() && !use_algo_cancel {
             let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
             let dispatch_state = self.dispatch_state.clone();
 
@@ -895,12 +1101,19 @@ impl BinanceFuturesExecutionClient {
                 Ok(())
             });
 
-            return;
+            return Ok(());
         }
 
         let http_client = self.http_client.clone();
+        let write_gate = self.write_gate.clone();
 
         self.spawn_task("cancel_order", async move {
+            let write_gate = write_gate.ok_or(ExecutionWriteGateError::MissingGate)?;
+            final_payload.validate_first_release(&write_context)?;
+            let mut permit = write_gate
+                .acquire(&write_context, &final_payload)
+                .await?;
+            permit.arm_before_transport(&final_payload)?;
             let result = if use_algo_cancel {
                 // Try algo cancel first; if it fails, the order may have been triggered
                 // before this session started, so fall back to regular cancel
@@ -920,6 +1133,15 @@ impl BinanceFuturesExecutionClient {
                     .await
                     .map(|_| ())
             };
+
+            let outcome = match &result {
+                Ok(()) => TransportOutcomeClass::AcceptedNonterminal,
+                Err(error) if is_structured_venue_rejection(error) => {
+                    TransportOutcomeClass::RejectedDefinitive
+                }
+                Err(_) => TransportOutcomeClass::OutcomeUnknown,
+            };
+            permit.record_outcome(outcome);
 
             match result {
                 Ok(()) => {
@@ -960,6 +1182,7 @@ impl BinanceFuturesExecutionClient {
 
             Ok(())
         });
+        Ok(())
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -2198,6 +2421,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             return Ok(());
         }
 
+        validate_futures_first_release_order(&order, cmd.params.as_ref(), self.is_hedge_mode())?;
+
         // Validate before submission (Initialized -> Denied is valid,
         // but Submitted -> Denied is not, so validate before emitting OrderSubmitted)
         if let Some(offset_type) = order.trailing_offset_type() {
@@ -2255,6 +2480,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        deny_first_release_write(ExecutionWriteKind::SubmitList)?;
         if cmd.order_list.client_order_ids.is_empty() {
             log::debug!("submit_order_list called with empty order list");
             return Ok(());
@@ -2411,6 +2637,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        deny_first_release_write(ExecutionWriteKind::Modify)?;
         let order = {
             let cache = self.core.cache();
             cache.order(&cmd.client_order_id).map(|o| o.clone())
@@ -2613,12 +2840,20 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         Ok(())
     }
 
-    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
-        self.cancel_order_internal(&cmd);
+    fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        deny_first_release_write(ExecutionWriteKind::BatchModify)?;
+        for modify in cmd.modifies {
+            self.modify_order(modify)?;
+        }
         Ok(())
     }
 
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        self.cancel_order_internal(&cmd)
+    }
+
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        deny_first_release_write(ExecutionWriteKind::CancelAll)?;
         let http_client = self.http_client.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2651,6 +2886,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         const BATCH_SIZE: usize = 10;
+        deny_first_release_write(ExecutionWriteKind::BatchCancel)?;
 
         if cmd.cancels.is_empty() {
             return Ok(());
@@ -2777,11 +3013,156 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 }
 
+fn deny_first_release_write(kind: ExecutionWriteKind) -> anyhow::Result<()> {
+    Err(ExecutionWriteGateError::Unsupported(kind).into())
+}
+
+fn validate_futures_first_release_order(
+    order: &OrderAny,
+    params: Option<&Params>,
+    is_hedge_mode: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_hedge_mode,
+        "first-release Binance Futures requires one-way mode"
+    );
+    anyhow::ensure!(
+        matches!(order.order_type(), OrderType::Market | OrderType::Limit),
+        "first-release Binance Futures rejects conditional or algorithm order type {:?}",
+        order.order_type()
+    );
+    anyhow::ensure!(
+        order.trigger_price().is_none()
+            && order.activation_price().is_none()
+            && order.trailing_offset().is_none()
+            && order.trigger_type().is_none(),
+        "first-release Binance Futures rejects trigger and algorithm controls"
+    );
+    anyhow::ensure!(
+        !order.is_quote_quantity() && order.display_qty().is_none(),
+        "first-release Binance Futures requires base quantity without display quantity"
+    );
+    anyhow::ensure!(
+        !params
+            .and_then(|params| params.get_bool("close_position"))
+            .unwrap_or(false),
+        "first-release Binance Futures rejects close_position"
+    );
+    anyhow::ensure!(
+        params
+            .and_then(|params| params.get_str("price_match"))
+            .is_none(),
+        "first-release Binance Futures rejects price_match"
+    );
+    Ok(())
+}
+
+fn final_time_in_force(
+    order_type: OrderType,
+    time_in_force: nautilus_model::enums::TimeInForce,
+    post_only: bool,
+) -> anyhow::Result<ExecutionTimeInForce> {
+    if order_type == OrderType::Market {
+        return Ok(ExecutionTimeInForce::NotApplicable);
+    }
+    if post_only {
+        return Ok(ExecutionTimeInForce::Gtx);
+    }
+    match time_in_force {
+        nautilus_model::enums::TimeInForce::Gtc => Ok(ExecutionTimeInForce::Gtc),
+        nautilus_model::enums::TimeInForce::Ioc => Ok(ExecutionTimeInForce::Ioc),
+        nautilus_model::enums::TimeInForce::Fok => Ok(ExecutionTimeInForce::Fok),
+        unsupported => {
+            anyhow::bail!("first-release Binance Futures rejects time in force {unsupported:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use rstest::rstest;
 
     use super::*;
+
+    fn serialized_field_names<T: serde::Serialize>(value: &T) -> BTreeSet<String> {
+        serde_urlencoded::to_string(value)
+            .unwrap()
+            .split('&')
+            .map(|pair| pair.split_once('=').unwrap().0.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn final_futures_unsigned_request_field_inventory_is_exhaustive() {
+        let submit = BinanceNewOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceFuturesOrderType::Limit,
+            position_side: Some(BinancePositionSide::Both),
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            reduce_only: Some(false),
+            price: Some("50000".to_string()),
+            new_client_order_id: Some("SAE-FUTURES-1".to_string()),
+            stop_price: Some("49000".to_string()),
+            close_position: Some(false),
+            activation_price: Some("49000".to_string()),
+            callback_rate: Some("1.0".to_string()),
+            working_type: Some(BinanceWorkingType::MarkPrice),
+            price_protect: Some(false),
+            new_order_resp_type: Some("ACK".to_string()),
+            good_till_date: Some(1),
+            recv_window: Some(5_000),
+            price_match: Some(BinancePriceMatch::Opponent),
+            self_trade_prevention_mode: Some(
+                crate::common::enums::BinanceSelfTradePreventionMode::ExpireMaker,
+            ),
+        };
+        assert_eq!(
+            serialized_field_names(&submit),
+            [
+                "symbol",
+                "side",
+                "type",
+                "positionSide",
+                "timeInForce",
+                "quantity",
+                "reduceOnly",
+                "price",
+                "newClientOrderId",
+                "stopPrice",
+                "closePosition",
+                "activationPrice",
+                "callbackRate",
+                "workingType",
+                "priceProtect",
+                "newOrderRespType",
+                "goodTillDate",
+                "recvWindow",
+                "priceMatch",
+                "selfTradePreventionMode",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+
+        let cancel = crate::futures::http::query::BinanceCancelOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            order_id: Some(1),
+            orig_client_order_id: Some("SAE-FUTURES-1".to_string()),
+            recv_window: Some(5_000),
+        };
+        assert_eq!(
+            serialized_field_names(&cancel),
+            ["symbol", "orderId", "origClientOrderId", "recvWindow"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
 
     fn http_error(code: i64) -> anyhow::Error {
         anyhow::Error::new(BinanceFuturesHttpError::BinanceError {

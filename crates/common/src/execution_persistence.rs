@@ -46,7 +46,8 @@ pub struct StagedExecutionWrite {
 }
 
 /// Native command kinds which can result in a venue mutation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionWriteKind {
     /// Submit one order.
     Submit,
@@ -60,6 +61,8 @@ pub enum ExecutionWriteKind {
     Cancel,
     /// Cancel multiple exact orders.
     BatchCancel,
+    /// Cancel every order on one instrument, deny-only at the first-release boundary.
+    CancelAll,
     /// Retry a previously constructed mutation.
     Retry,
 }

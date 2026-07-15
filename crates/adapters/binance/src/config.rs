@@ -147,6 +147,12 @@ pub struct BinanceExecClientConfig {
     /// Whether to use the WebSocket trading API for order operations (Spot and USD-M Futures).
     #[builder(default = true)]
     pub use_ws_trading: bool,
+    /// Whether order mutations may use the replayable WebSocket trading transport.
+    ///
+    /// The first writer-authorized release requires this to remain false. Spot may still keep the
+    /// authenticated WebSocket session active for private user data.
+    #[builder(default = false)]
+    pub use_ws_order_transport: bool,
     /// Whether Spot connection readiness requires authenticated WS user data.
     ///
     /// When enabled, authentication, subscription, or dispatch setup failure fails connect
@@ -204,6 +210,21 @@ impl Default for BinanceExecClientConfig {
 impl ClientConfig for BinanceExecClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl BinanceExecClientConfig {
+    /// Validates the fixed first-release final-write transport boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when replayable WebSocket order transport is enabled.
+    pub fn validate_first_release_write_boundary(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.use_ws_order_transport,
+            "first-release Binance order transport must use HTTP"
+        );
+        Ok(())
     }
 }
 
@@ -265,6 +286,7 @@ product_types = ["SPOT", "USD_M"]
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.product_type, expected.product_type);
         assert_eq!(config.use_ws_trading, expected.use_ws_trading);
+        assert!(!config.use_ws_order_transport);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
         assert_eq!(config.default_taker_fee, expected.default_taker_fee);
         assert_eq!(
@@ -273,5 +295,16 @@ product_types = ["SPOT", "USD_M"]
         );
         assert_eq!(config.use_trade_lite, expected.use_trade_lite);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_first_release_rejects_ws_order_transport_without_disabling_private_ws() {
+        let config = BinanceExecClientConfig::builder()
+            .use_ws_trading(true)
+            .use_ws_order_transport(true)
+            .build();
+
+        assert!(config.validate_first_release_write_boundary().is_err());
+        assert!(config.use_ws_trading);
     }
 }

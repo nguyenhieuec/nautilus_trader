@@ -135,6 +135,7 @@ impl BinanceExecClientConfig {
             base_url_ws: base_url_ws.or(defaults.base_url_ws),
             base_url_ws_trading: base_url_ws_trading.or(defaults.base_url_ws_trading),
             use_ws_trading,
+            use_ws_order_transport: false,
             use_position_ids,
             default_taker_fee: default_taker_fee
                 .map_or_else(|| Ok(defaults.default_taker_fee), Decimal::try_from)

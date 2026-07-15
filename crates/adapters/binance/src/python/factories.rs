@@ -28,7 +28,7 @@ impl BinanceDataClientFactory {
     /// Factory for creating Binance data clients.
     #[new]
     fn py_new() -> Self {
-        Self
+        Self::new()
     }
 
     #[pyo3(name = "name")]

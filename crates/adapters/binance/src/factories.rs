@@ -21,6 +21,7 @@ use nautilus_common::{
     cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
+    execution_write::{ExecutionWriteGateError, ExecutionWriteGateHandle},
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
 };
 use nautilus_live::ExecutionClientCore;
@@ -122,13 +123,23 @@ impl DataClientFactory for BinanceDataClientFactory {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.binance")
 )]
-pub struct BinanceExecutionClientFactory;
+pub struct BinanceExecutionClientFactory {
+    write_gate: Option<ExecutionWriteGateHandle>,
+}
 
 impl BinanceExecutionClientFactory {
     /// Creates a new [`BinanceExecutionClientFactory`] instance.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { write_gate: None }
+    }
+
+    /// Creates a production-capable factory with one shared final-write gate.
+    #[must_use]
+    pub fn with_write_gate(write_gate: ExecutionWriteGateHandle) -> Self {
+        Self {
+            write_gate: Some(write_gate),
+        }
     }
 }
 
@@ -154,6 +165,11 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
                 )
             })?
             .clone();
+        binance_config.validate_first_release_write_boundary()?;
+        let write_gate = self
+            .write_gate
+            .clone()
+            .ok_or(ExecutionWriteGateError::MissingGate)?;
 
         let product_type = binance_config.product_type;
 
@@ -174,7 +190,11 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
                     cache,
                 );
 
-                let client = BinanceSpotExecutionClient::new(core, binance_config)?;
+                let client = BinanceSpotExecutionClient::new_with_write_gate(
+                    core,
+                    binance_config,
+                    write_gate,
+                )?;
                 Ok(Box::new(client))
             }
             BinanceProductType::UsdM | BinanceProductType::CoinM => {
@@ -193,7 +213,11 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
                     cache,
                 );
 
-                let client = BinanceFuturesExecutionClient::new(core, binance_config)?;
+                let client = BinanceFuturesExecutionClient::new_with_write_gate(
+                    core,
+                    binance_config,
+                    write_gate,
+                )?;
                 Ok(Box::new(client))
             }
             _ => {
@@ -215,7 +239,10 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::factories::DataClientFactory;
+    use nautilus_common::{
+        cache::Cache,
+        factories::{DataClientFactory, ExecutionClientFactory},
+    };
     use rstest::rstest;
 
     use super::*;
@@ -231,5 +258,25 @@ mod tests {
     fn test_binance_data_client_factory_default() {
         let factory = BinanceDataClientFactory;
         assert_eq!(factory.name(), BINANCE);
+    }
+
+    #[rstest]
+    fn test_binance_execution_factory_fails_without_write_gate() {
+        let factory = BinanceExecutionClientFactory::new();
+        let cache = CacheView::from(Rc::new(RefCell::new(Cache::default())));
+        let error = ExecutionClientFactory::create(
+            &factory,
+            "BINANCE-SPOT",
+            &BinanceExecClientConfig::default(),
+            cache,
+        )
+        .err()
+        .expect("factory without a write gate must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("execution write gate is missing")
+        );
     }
 }
